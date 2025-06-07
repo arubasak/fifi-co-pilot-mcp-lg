@@ -14,7 +14,6 @@ MESSAGES_TO_KEEP_AFTER_PRUNING = 6
 TOKEN_MODEL_ENCODING = "cl100k_base"
 
 # --- Load environment variables from secrets ---
-# ... (your existing secret loading) ...
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 MCP_PINECONE_URL = st.secrets.get("MCP_PINECONE_URL")
 MCP_PINECONE_API_KEY = st.secrets.get("MCP_PINECONE_API_KEY")
@@ -24,29 +23,24 @@ if not all([OPENAI_API_KEY, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREA
     st.error("One or more secrets are missing. Please configure them in Streamlit secrets.")
     st.stop()
 
-
 llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.2)
 THREAD_ID = "fifi_streamlit_session"
 
 def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> int:
-    # ... (your existing count_tokens function) ...
     if not messages: return 0
     try: encoding = tiktoken.get_encoding(model_encoding)
-    except Exception:
-        encoding = tiktoken.get_encoding("cl100k_base") # Fallback
+    except Exception: encoding = tiktoken.get_encoding("cl100k_base")
     num_tokens = 0
     for message in messages:
         num_tokens += 4
         for key, value in message.items():
             if value is not None:
                 try: num_tokens += len(encoding.encode(str(value)))
-                except TypeError: pass 
+                except TypeError: pass
     num_tokens += 2
     return num_tokens
 
-
 def prune_history_if_needed(memory_instance: MemorySaver, thread_config: dict, current_system_prompt_content: str, max_tokens: int, keep_last_n_interactions: int):
-    # ... (your existing prune_history_if_needed function) ...
     checkpoint_value = memory_instance.get(thread_config)
     if not checkpoint_value or "messages" not in checkpoint_value or not isinstance(checkpoint_value.get("messages"), list):
         return False
@@ -59,98 +53,63 @@ def prune_history_if_needed(memory_instance: MemorySaver, thread_config: dict, c
         pruned_user_assistant_messages = user_assistant_messages[-keep_last_n_interactions:]
         new_history_messages = [{"role": "system", "content": current_system_prompt_content}]
         new_history_messages.extend(pruned_user_assistant_messages)
-        memory_instance.put(thread_config, {"messages": new_history_messages}) 
+        memory_instance.put(thread_config, {"messages": new_history_messages})
         print(f"INFO: History pruned. New token count: {count_tokens(new_history_messages)}.")
         return True
     return False
 
 # --- Agent Initialization ---
+# This async function does the actual work. It's decorated with @st.cache_resource.
 @st.cache_resource(ttl=3600) 
-async def initialize_agent_components_async(): # Renamed to clearly mark as async
-    print("@@@ ASYNC initialize_agent_components_async: Starting actual resource initialization (cached)...")
+async def initialize_agent_core_resources():
+    print("@@@ ASYNC initialize_agent_core_resources: Starting actual resource initialization (cached)...")
     client = MultiServerMCPClient({
         "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
         "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
     })
     tools = await client.get_tools()
 
-    identified_pinecone_tool_name = "functions.get_context"
-    identified_woocommerce_tool_names = []
-    identified_all_tool_details = {}
-
-    for tool in tools:
-        identified_all_tool_details[tool.name] = tool.description
-        if tool.name == "functions.get_context": 
-            identified_pinecone_tool_name = tool.name
-        elif "woocommerce" in tool.name.lower(): 
-            identified_woocommerce_tool_names.append(tool.name)
-    
-    print(f"    Pinecone tool identified as: {identified_pinecone_tool_name}")
-    if not identified_woocommerce_tool_names: print("    Warning: No WooCommerce tools identified.")
-
     memory = MemorySaver()
     agent_executor = create_react_agent(llm, tools, checkpointer=memory)
-    print("@@@ ASYNC initialize_agent_components_async: Initialization complete.")
-    return { 
-        "agent_executor": agent_executor,
-        "memory_instance": memory,
-        "pinecone_tool_name": identified_pinecone_tool_name,
-        "woocommerce_tool_names": identified_woocommerce_tool_names,
-        "all_tool_details_for_prompt": identified_all_tool_details,
-    }
+    
+    print("@@@ ASYNC initialize_agent_core_resources: Initialization complete.")
+    return agent_executor, memory, tools
 
-# --- Function to load components into session state ---
-# This is now synchronous. It relies on Streamlit to run the async cached function.
+# This synchronous function is our single entry point for initialization.
 def load_and_store_agent_components():
-    if "components_loaded" not in st.session_state or not st.session_state.components_loaded:
-        print("@@@ load_and_store_agent_components: components_loaded flag not set or false. Accessing cached resource.")
+    if "components_loaded" not in st.session_state:
+        print("@@@ load_and_store: components_loaded flag not set. Calling asyncio.run()...")
         try:
-            # When initialize_agent_components_async() is called here for the first time,
-            # Streamlit's @st.cache_resource should handle running the async function.
-            # It will return a coroutine object on the very first script run if it hasn't completed.
-            # On subsequent reruns (after Streamlit has run the async part), it should return the actual result.
-            components_result = initialize_agent_components_async()
+            # Run the async function once and get all its results.
+            agent_executor, memory, tools = asyncio.run(initialize_agent_core_resources())
+            
+            # Store everything in session state.
+            st.session_state.agent_executor = agent_executor
+            st.session_state.memory_instance = memory
+            
+            # Identify tools and store their info here, synchronously.
+            st.session_state.pinecone_tool_name = "functions.get_context"
+            st.session_state.woocommerce_tool_names = []
+            st.session_state.all_tool_details_for_prompt = {}
 
-            if asyncio.iscoroutine(components_result):
-                # This means Streamlit returned the coroutine object because it's the first time
-                # and it hasn't run it yet in its background mechanism.
-                # We instruct the user to wait and trigger a rerun.
-                # Streamlit should execute the async function between this run and the next.
-                print("@@@ load_and_store_agent_components: Received coroutine. Streamlit needs to run it. Rerunning.")
-                if "init_rerun_triggered" not in st.session_state: # Prevent infinite reruns
-                    st.session_state.init_rerun_triggered = True
-                    st.warning("Agent is initializing. The app will refresh in a moment...")
-                    # Forcing a rerun quickly so Streamlit has a chance to process the async cache
-                    # A small delay might sometimes help in local dev if reruns are too fast.
-                    # For cloud, st.rerun() is usually enough.
-                    st.rerun() 
-                else:
-                    # If we're here after an init_rerun_triggered, something is stuck.
-                    st.error("Agent initialization is taking longer than expected. Please try refreshing the page manually.")
-                    st.stop()
-                return False # Indicate components are not yet ready
-            else:
-                # If it's not a coroutine, it should be the cached result (the dictionary)
-                print("@@@ load_and_store_agent_components: Received cached result.")
-                st.session_state.agent_executor = components_result["agent_executor"]
-                st.session_state.memory_instance = components_result["memory_instance"]
-                st.session_state.pinecone_tool_name = components_result["pinecone_tool_name"]
-                st.session_state.woocommerce_tool_names = components_result["woocommerce_tool_names"]
-                st.session_state.all_tool_details_for_prompt = components_result["all_tool_details_for_prompt"]
-                st.session_state.components_loaded = True
-                if "init_rerun_triggered" in st.session_state: # Clean up the temp flag
-                    del st.session_state.init_rerun_triggered
-                print("@@@ load_and_store_agent_components: Components loaded into session state successfully.")
-                return True # Indicate components are ready
+            for tool in tools:
+                st.session_state.all_tool_details_for_prompt[tool.name] = tool.description
+                if tool.name == "functions.get_context":
+                    st.session_state.pinecone_tool_name = tool.name
+                elif "woocommerce" in tool.name.lower():
+                    st.session_state.woocommerce_tool_names.append(tool.name)
 
+            print(f"    Tools identified and stored in session state.")
+            st.session_state.components_loaded = True
+            print("@@@ load_and_store: Components loaded into session state successfully.")
+        
         except Exception as e:
-            print(f"@@@ ERROR during load_and_store_agent_components: {e}")
-            st.error(f"Critical error during agent initialization: {e}")
-            st.session_state.components_loaded = False 
-            return False # Indicate components are not ready
-    # else:
-        # print("@@@ load_and_store_agent_components: components_loaded flag is true.")
-    return True # Components already loaded
+            # This will catch the "cannot reuse already awaited coroutine" or any other init error.
+            print(f"@@@ ERROR during asyncio.run(initialize_agent_core_resources): {e}")
+            st.error(f"A critical error occurred during agent initialization. Please refresh the page. Error: {e}")
+            st.session_state.components_loaded = False
+            # We must stop the app if initialization fails.
+            st.stop()
 
 # --- Initialize session state (basic flags) ---
 if "messages" not in st.session_state: st.session_state.messages = []
@@ -159,8 +118,7 @@ if 'query_to_process' not in st.session_state: st.session_state.query_to_process
 
 # --- System Prompt Definition ---
 def get_system_prompt():
-    # ... (Your get_system_prompt function remains IDENTICAL to the last version) ...
-    pinecone_tool = st.session_state.get('pinecone_tool_name', "functions.get_context") 
+    pinecone_tool = st.session_state.get('pinecone_tool_name', "functions.get_context")
     all_tool_details = st.session_state.get('all_tool_details_for_prompt', {})
     prompt = f"""You are FiFi, an expert AI assistant for 1-2-Taste. Your **sole purpose** is to assist users with inquiries related to 1-2-Taste's products, the food and beverage ingredients industry, food science topics relevant to 1-2-Taste's offerings, B2B inquiries, recipe development support using 1-2-Taste ingredients, and specific e-commerce functions related to 1-2-Taste's WooCommerce platform.
 
@@ -218,22 +176,13 @@ Answer the user's last query based on these instructions and the conversation hi
 async def execute_agent_call_with_memory(user_query: str):
     assistant_reply = ""
     try:
-        if not st.session_state.get("components_loaded", False): # Check flag
-            print("@@@ execute_agent_call: FATAL - components not loaded before execution attempt.")
-            st.error("Agent is not ready. Please try refreshing the page or wait a moment.")
-            # Append error to UI messages and stop this execution path
-            st.session_state.messages.append({"role": "assistant", "content": "(Critical Error: Agent not ready. Please refresh.)"})
-            st.session_state.thinking_for_ui = False # Reset thinking flag
-            st.rerun() # Rerun to display the error and stop processing this query
-            return # Exit this function
-
-        agent_executor = st.session_state.get("agent_executor")
-        memory_instance = st.session_state.get("memory_instance")
-
-        if agent_executor is None or memory_instance is None:
-            st.error("Agent or Memory instance is missing from session state. This should not happen if components_loaded is true.")
-            assistant_reply = "(Error: Agent/Memory components missing)"
+        if not st.session_state.get("components_loaded", False):
+            st.error("Agent is not ready. Please refresh the page.")
+            assistant_reply = "(Critical Error: Agent not initialized)"
         else:
+            agent_executor = st.session_state.agent_executor
+            memory_instance = st.session_state.memory_instance
+
             config = {"configurable": {"thread_id": THREAD_ID}}
             system_prompt_content = get_system_prompt()
 
@@ -275,32 +224,12 @@ def handle_new_query_submission(query_text: str):
 # --- Streamlit App Starts Here ---
 st.title("FiFi Co-Pilot 🚀 (LangGraph MCP Agent with Auto-Pruning Memory)")
 
-# --- This is the CRUCIAL change for initialization ---
-# Call the synchronous loader function. It handles the logic internally.
-components_ready = load_and_store_agent_components()
-# --- End of CRUCIAL initialization change ---
-
+# --- Call the synchronous loader function at the start of the script ---
+load_and_store_agent_components()
 
 # --- UI Rendering ---
-if not components_ready and "init_rerun_triggered" in st.session_state:
-    # If load_and_store_agent_components returned False because it triggered a rerun
-    # for async initialization, we might not want to render the full UI yet,
-    # or just show the warning it might have already displayed.
-    # st.stop() might have been called if it got a coroutine, so this check might be redundant
-    # if st.stop() was effective.
-    print("@@@ Main UI: components_ready is False and init_rerun_triggered. Waiting for next rerun.")
-    # The st.warning and st.stop() inside load_and_store_agent_components should handle this.
-    # If execution reaches here, it means st.stop() wasn't called or was ineffective.
-    if not st.session_state.get("components_loaded"): # Double check
-        st.warning("Agent initialization is in progress. Please wait for the app to refresh.")
-        # It's possible st.stop() doesn't halt execution immediately in all contexts before
-        # subsequent code in the same script run is parsed.
-        # To be absolutely sure nothing else runs if components aren't ready after init attempt:
-        st.stop() 
-
-
-
-# Sidebar
+# The rest of the UI should now safely assume that either the components are loaded
+# or the app has been stopped with an error during initialization.
 st.sidebar.markdown("## Quick Questions")
 preview_questions = [
     "Help me with my recipe for a new juice drink",
@@ -317,14 +246,12 @@ if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
     st.session_state.thinking_for_ui = False
     st.session_state.query_to_process = None
     
-    for key in ["agent_executor", "memory_instance", 
-                "pinecone_tool_name", "woocommerce_tool_names", 
-                "all_tool_details_for_prompt", "components_loaded",
-                "init_rerun_triggered"]: # also clear the temp flag
-        if key in st.session_state:
-            del st.session_state[key]
+    # Clear all session state keys related to the agent to trigger re-initialization on next run
+    for key in list(st.session_state.keys()):
+        if key not in ['messages', 'thinking_for_ui', 'query_to_process']:
+             del st.session_state[key]
             
-    initialize_agent_components_async.clear() # Clear the cache 
+    initialize_agent_core_resources.clear() 
     print("@@@ Chat history cleared, cache cleared, session state for agent components cleared.")
     st.rerun()
 
@@ -354,21 +281,22 @@ if st.session_state.get('thinking_for_ui', False):
         st.markdown("⌛ FiFi is thinking...")
 
 if st.session_state.get('thinking_for_ui', False) and st.session_state.get('query_to_process') is not None:
-    if not st.session_state.get("components_loaded", False): 
-        print("@@@ Query processing: Components not loaded. This indicates an issue with initial load.")
-        st.error("Agent is not ready. Please refresh the page.")
-        st.session_state.thinking_for_ui = False
-        st.session_state.query_to_process = None  
-        st.rerun() 
-    else:
+    # A simple check to ensure we don't process if init failed.
+    if st.session_state.get("components_loaded"):
         query_to_run = st.session_state.query_to_process
         st.session_state.query_to_process = None
+        # This is now the ONLY place asyncio.run is called for agent interaction
         asyncio.run(execute_agent_call_with_memory(query_to_run))
-
+    else:
+        # If components aren't loaded, we shouldn't have gotten this far,
+        # but as a safeguard, we reset the thinking state.
+        st.session_state.thinking_for_ui = False
+        st.session_state.query_to_process = None
+        st.rerun()
 
 user_prompt = st.chat_input("Ask FiFi Co-Pilot...", key="main_chat_input",
                             disabled=st.session_state.get('thinking_for_ui', False) or \
-                                     not st.session_state.get("components_loaded", False) # Disable if not loaded
+                                     not st.session_state.get("components_loaded", False)
                            )
 if user_prompt:
     handle_new_query_submission(user_prompt)
