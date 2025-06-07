@@ -9,7 +9,7 @@ from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # --- Constants for History Pruning ---
-# GPT-4.1-mini's context is 200k tokens as per 
+# GPT-4o-mini's context is 200k tokens as per 
 # This is for the HISTORY, not a single request's TPM limit.
 # TPM is about throughput, this is about context window size for a single call.
 MAX_HISTORY_TOKENS = 80000  # Prune if history exceeds this. Adjust based on model (4o-mini might need lower)
@@ -26,8 +26,8 @@ if not all([OPENAI_API_KEY, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREA
     st.error("One or more secrets are missing. Please configure them in Streamlit secrets.")
     st.stop()
 
-# --- LangChain LLM (OpenAI GPT-4.1-mini) ---
-llm = ChatOpenAI(model="gpt-4.1-mini", api_key=OPENAI_API_KEY, temperature=0.2) # Corrected to gpt-4.1-mini
+# --- LangChain LLM (OpenAI GPT-4o-mini) ---
+llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.2) # Corrected to gpt-4o-mini
 
 # Define a constant for our conversation thread ID
 THREAD_ID = "fifi_streamlit_session"
