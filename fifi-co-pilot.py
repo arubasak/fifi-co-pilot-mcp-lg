@@ -1,7 +1,7 @@
 import streamlit as st
 import datetime
 import asyncio
-import tiktoken  # Import tiktoken
+import tiktoken
 
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
@@ -9,12 +9,9 @@ from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # --- Constants for History Pruning ---
-# GPT-4o-mini's context is 200k tokens as per 
-# This is for the HISTORY, not a single request's TPM limit.
-# TPM is about throughput, this is about context window size for a single call.
-MAX_HISTORY_TOKENS = 80000  # Prune if history exceeds this. Adjust based on model (4o-mini might need lower)
-MESSAGES_TO_KEEP_AFTER_PRUNING = 6  # Keep ~last 3 user/assistant turns. System prompt is re-added.
-TOKEN_MODEL_ENCODING = "cl100k_base"  # Encoding for gpt-4, gpt-3.5-turbo, text-embedding-ada-002, and gpt-4o models
+MAX_HISTORY_TOKENS = 80000
+MESSAGES_TO_KEEP_AFTER_PRUNING = 6
+TOKEN_MODEL_ENCODING = "cl100k_base"
 
 # --- Load environment variables from secrets ---
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
@@ -26,140 +23,113 @@ if not all([OPENAI_API_KEY, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREA
     st.error("One or more secrets are missing. Please configure them in Streamlit secrets.")
     st.stop()
 
-# --- LangChain LLM (OpenAI GPT-4o-mini) ---
-llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.2) # Corrected to gpt-4o-mini
-
-# Define a constant for our conversation thread ID
+llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.2)
 THREAD_ID = "fifi_streamlit_session"
 
-
-# --- Token Counting Helper ---
 def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> int:
-    if not messages:
-        return 0
-    try:
-        encoding = tiktoken.get_encoding(model_encoding)
+    if not messages: return 0
+    try: encoding = tiktoken.get_encoding(model_encoding)
     except Exception:
-        print(f"Warning: Encoding {model_encoding} not found or tiktoken issue. Using 'cl100k_base' as fallback.")
+        print(f"Warning: Encoding {model_encoding} not found. Using 'cl100k_base'.")
         encoding = tiktoken.get_encoding("cl100k_base")
-
     num_tokens = 0
     for message in messages:
         num_tokens += 4
         for key, value in message.items():
             if value is not None:
-                try:
-                    num_tokens += len(encoding.encode(str(value)))
-                except TypeError:
-                    print(
-                        f"Warning: Could not encode value of type {type(value)}. Skipping token count for this value.")
+                try: num_tokens += len(encoding.encode(str(value)))
+                except TypeError: print(f"Warning: Could not encode value of type {type(value)}.")
     num_tokens += 2
     return num_tokens
 
-
-# --- History Pruning Helper (Corrected Version) ---
 def prune_history_if_needed(
-        memory_instance: MemorySaver,
-        thread_config: dict,
-        current_system_prompt_content: str,
-        max_tokens: int,
-        keep_last_n_interactions: int
+    memory_instance: MemorySaver, thread_config: dict, current_system_prompt_content: str, 
+    max_tokens: int, keep_last_n_interactions: int 
 ):
     checkpoint_value = memory_instance.get(thread_config)
-
     if not checkpoint_value or "messages" not in checkpoint_value or \
-            not isinstance(checkpoint_value.get("messages"), list):
-        return False
-
+       not isinstance(checkpoint_value.get("messages"), list):
+        return False 
     current_messages_in_history = checkpoint_value["messages"]
     if not current_messages_in_history:
         return False
-
     current_token_count = count_tokens(current_messages_in_history)
-    # print(f"DEBUG (prune): Current history token count: {current_token_count}") 
-
-
     if current_token_count > max_tokens:
         print(f"INFO: History token count ({current_token_count}) > max ({max_tokens}). Pruning...")
-
         user_assistant_messages = [m for m in current_messages_in_history if m.get("role") != "system"]
         pruned_user_assistant_messages = user_assistant_messages[-keep_last_n_interactions:]
-
-        new_history_messages = []
-        new_history_messages.append({"role": "system", "content": current_system_prompt_content})
+        new_history_messages = [{"role": "system", "content": current_system_prompt_content}]
         new_history_messages.extend(pruned_user_assistant_messages)
-
         new_checkpoint_value_to_put = {"messages": new_history_messages}
-
         memory_instance.put(thread_config, new_checkpoint_value_to_put)
         pruned_token_count = count_tokens(new_history_messages)
-        print(
-            f"INFO: History pruned. New token count: {pruned_token_count}. Kept {len(pruned_user_assistant_messages)} user/assistant messages.")
+        print(f"INFO: History pruned. New token count: {pruned_token_count}.")
         return True
     return False
 
-
-# --- Async function to initialize LangChain Agent with Memory ---
-@st.cache_resource
-async def get_agent_with_memory_tuple():  # Renamed to reflect it returns a tuple
-    print("Initializing agent with memory and fetching tools...")
+# --- Modified Agent Initialization and Access ---
+@st.cache_resource(ttl=3600) 
+async def initialize_agent_core_resources(): # Renamed
+    print("@@@ Initializing ALL agent core resources (cached)...")
     client = MultiServerMCPClient(
         {
-            "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse",
-                         "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
+            "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
             "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
         }
     )
     tools = await client.get_tools()
 
-    st.session_state.pinecone_tool_name = "functions.get_context"
-    st.session_state.woocommerce_tool_names = []
-    st.session_state.all_tool_details_for_prompt = {}
+    identified_pinecone_tool_name = "functions.get_context"
+    identified_woocommerce_tool_names = []
+    identified_all_tool_details = {}
 
-    print("--- Identifying Tools based on provided list ---")
+    # print("--- Identifying Tools during resource initialization ---") # Less verbose
     for tool in tools:
-        st.session_state.all_tool_details_for_prompt[tool.name] = tool.description
+        identified_all_tool_details[tool.name] = tool.description
         if tool.name == "functions.get_context":
-            st.session_state.pinecone_tool_name = tool.name
-            # print(f"Confirmed Pinecone/get_context tool: {tool.name}") # Less verbose
+            identified_pinecone_tool_name = tool.name
         elif "woocommerce" in tool.name.lower():
-            st.session_state.woocommerce_tool_names.append(tool.name)
-    # print(f"Confirmed Pinecone tool: {st.session_state.pinecone_tool_name}") # Less verbose
-    if not st.session_state.woocommerce_tool_names:
-        print("Warning: No WooCommerce tools were identified based on 'woocommerce' in name.")
-    # else: # Less verbose
-        # print(f"Identified WooCommerce tools: {st.session_state.woocommerce_tool_names}")
-    print("-------------------------------------------------")
+            identified_woocommerce_tool_names.append(tool.name)
+    
+    # print(f"Confirmed Pinecone tool (init): {identified_pinecone_tool_name}") # Less verbose
+    # if not identified_woocommerce_tool_names: print("Warning: No WooCommerce tools identified (init).")
+    # else: print(f"Identified WooCommerce tools (init): {identified_woocommerce_tool_names}")
+    # print("-------------------------------------------------")
 
     memory = MemorySaver()
     agent_executor = create_react_agent(llm, tools, checkpointer=memory)
-    print("Agent with memory initialized successfully.")
-    return agent_executor, memory
+    print("Agent with memory initialized successfully (cached).")
+    return agent_executor, memory, identified_pinecone_tool_name, identified_woocommerce_tool_names, identified_all_tool_details
 
+async def load_agent_components_into_session():
+    if "components_loaded" not in st.session_state or not st.session_state.components_loaded: # Check flag
+        print("@@@ components_loaded flag not set or false, attempting to load agent components into session_state...")
+        try:
+            agent_executor, memory, pinecone_name, woo_names, all_details = await initialize_agent_core_resources()
+            st.session_state.agent_executor = agent_executor
+            st.session_state.memory_instance = memory
+            st.session_state.pinecone_tool_name = pinecone_name
+            st.session_state.woocommerce_tool_names = woo_names
+            st.session_state.all_tool_details_for_prompt = all_details
+            st.session_state.components_loaded = True # Set flag after successful load
+            print("@@@ Agent components loaded into session state successfully.")
+        except Exception as e:
+            print(f"@@@ ERROR during load_agent_components_into_session: {e}")
+            st.error(f"Critical error during agent initialization: {e}")
+            # Potentially stop the app or prevent further agent calls if init fails
+            st.session_state.components_loaded = False # Explicitly set to false on error
+            # raise # Optionally re-raise if you want the app to halt here
 
-async def ensure_agent_is_initialized():
-    if 'agent_with_memory_tuple' not in st.session_state or st.session_state.agent_with_memory_tuple is None:
-        st.session_state.agent_with_memory_tuple = await get_agent_with_memory_tuple()
-
-    if 'pinecone_tool_name' not in st.session_state: st.session_state.pinecone_tool_name = "functions.get_context"
-    if 'woocommerce_tool_names' not in st.session_state: st.session_state.woocommerce_tool_names = []
-    if 'all_tool_details_for_prompt' not in st.session_state: st.session_state.all_tool_details_for_prompt = {}
-
-    return st.session_state.agent_with_memory_tuple
-
-
-# --- Initialize session state ---
+# --- Initialize session state (basic flags) ---
 if "messages" not in st.session_state: st.session_state.messages = []
 if 'thinking_for_ui' not in st.session_state: st.session_state.thinking_for_ui = False
 if 'query_to_process' not in st.session_state: st.session_state.query_to_process = None
-if 'pinecone_tool_name' not in st.session_state: st.session_state.pinecone_tool_name = "functions.get_context"
-if 'woocommerce_tool_names' not in st.session_state: st.session_state.woocommerce_tool_names = []
-if 'all_tool_details_for_prompt' not in st.session_state: st.session_state.all_tool_details_for_prompt = {}
-
+# Tool names and other components will be set by load_agent_components_into_session
 
 # --- System Prompt Definition ---
 def get_system_prompt():
-    pinecone_tool = st.session_state.get('pinecone_tool_name', "functions.get_context")
+    pinecone_tool = st.session_state.get('pinecone_tool_name', "functions.get_context") # Default if not loaded
+    all_tool_details = st.session_state.get('all_tool_details_for_prompt', {})
     prompt = f"""You are FiFi, an expert AI assistant for 1-2-Taste. Your **sole purpose** is to assist users with inquiries related to 1-2-Taste's products, the food and beverage ingredients industry, food science topics relevant to 1-2-Taste's offerings, B2B inquiries, recipe development support using 1-2-Taste ingredients, and specific e-commerce functions related to 1-2-Taste's WooCommerce platform.
 
 **Core Mission:**
@@ -170,7 +140,7 @@ def get_system_prompt():
 **Tool Usage Priority and Guidelines (Internal Instructions for You, the LLM):**
 
 1.  **Primary Product & Industry Information Tool (Internally known as `{pinecone_tool}`):**
-    *   For ANY query that could relate to 1-2-Taste product details, ingredients, flavors, availability, specifications, recipes, applications, food industry trends relevant to 1-2-Taste, or any information found within the 1-2-Taste catalog or relevant to its business, you **MUST ALWAYS PRIORITIZE** using this specialized tool (internally, its name is `{pinecone_tool}`). Its description is: "{st.session_state.all_tool_details_for_prompt.get(pinecone_tool, 'Retrieves relevant document snippets from the assistant knowledge base.')}" This is your main and most reliable knowledge source for product-related questions.
+    *   For ANY query that could relate to 1-2-Taste product details, ingredients, flavors, availability, specifications, recipes, applications, food industry trends relevant to 1-2-Taste, or any information found within the 1-2-Taste catalog or relevant to its business, you **MUST ALWAYS PRIORITIZE** using this specialized tool (internally, its name is `{pinecone_tool}`). Its description is: "{all_tool_details.get(pinecone_tool, 'Retrieves relevant document snippets from the assistant knowledge base.')}" This is your main and most reliable knowledge source for product-related questions.
     *   If a query is ambiguous but might be product-related (e.g., "tell me about vanilla"), assume it is about 1-2-Taste's context and use this tool first.
 
 2.  **E-commerce and Order Management Tools (Internally, these are your WooCommerce tools like `functions.WOOCOMMERCE-GET-ORDER`, etc.):**
@@ -205,7 +175,7 @@ def get_system_prompt():
     *   **If the tool provides product information but no specific source URL for a piece of that information, state that the information is from the 1-2-Taste catalog without providing a broken link.**
 *   If a product is discontinued according to your product information tool, inform the user and, if possible, suggest alternatives found via the same tool (citing them as well).
 *   **Do not provide product prices.** Instead, thank the user for asking and direct them to the product page on the 1-2-Taste website or to contact sales-eu@12taste.com.
-*   If a product is marked as (QUOTE ONLY) and price is missing, ask them to visit: https://www.12taste.com/request-quote/. (Note: your original prompt said "ask them to first create an account and then visit" - I've kept the simpler version from before. If account creation is a strict prerequisite, re-add that specific phrasing).
+*   If a product is marked as (QUOTE ONLY) and price is missing, ask them to visit: https://www.12taste.com/request-quote/.
 *   Keep answers concise and to the point.
 
 Answer the user's last query based on these instructions and the conversation history.
@@ -216,31 +186,38 @@ Answer the user's last query based on these instructions and the conversation hi
 async def execute_agent_call_with_memory(user_query: str):
     assistant_reply = ""
     try:
-        agent_executor, memory_instance = await ensure_agent_is_initialized()
+        # Ensure components are loaded before trying to get them from session state
+        if not st.session_state.get("components_loaded"):
+            print("@@@ execute_agent_call: Components not loaded, attempting to load now.")
+            await load_agent_components_into_session()
+            if not st.session_state.get("components_loaded"): # Check again
+                st.error("Critical error: Agent components could not be loaded for execute_agent_call.")
+                st.session_state.messages.append({"role": "assistant", "content": "(Error: Agent initialization failed, please refresh.)"})
+                st.session_state.thinking_for_ui = False
+                st.rerun() # Rerun to show the error message
+                return # Stop further execution in this call
+
+        agent_executor = st.session_state.get("agent_executor")
+        memory_instance = st.session_state.get("memory_instance")
 
         if agent_executor is None or memory_instance is None:
-            st.error("Agent or Memory could not be initialized.")
-            assistant_reply = "(Error: Agent/Memory not initialized)"
+            st.error("Agent or Memory could not be retrieved from session state after initialization attempt.")
+            assistant_reply = "(Error: Agent/Memory not properly available)"
         else:
             config = {"configurable": {"thread_id": THREAD_ID}}
             system_prompt_content = get_system_prompt()
 
             was_pruned = prune_history_if_needed(
-                memory_instance,
-                config,
-                system_prompt_content,
-                MAX_HISTORY_TOKENS,
-                MESSAGES_TO_KEEP_AFTER_PRUNING
+                memory_instance, config, system_prompt_content,
+                MAX_HISTORY_TOKENS, MESSAGES_TO_KEEP_AFTER_PRUNING
             )
-            # if was_pruned: # No need to print this in the non-debug version
-                # print(f"INFO: History was pruned for thread {THREAD_ID}")
+            # if was_pruned: print(f"INFO: History was pruned for thread {THREAD_ID}")
 
             current_turn_messages = [
                 {"role": "system", "content": system_prompt_content},
                 {"role": "user", "content": user_query}
             ]
             event = {"messages": current_turn_messages}
-
             result = await agent_executor.ainvoke(event, config=config)
 
             if isinstance(result, dict) and "messages" in result and result["messages"]:
@@ -258,7 +235,6 @@ async def execute_agent_call_with_memory(user_query: str):
     st.session_state.thinking_for_ui = False
     st.rerun()
 
-
 # --- Input Handling Function ---
 def handle_new_query_submission(query_text: str):
     if not st.session_state.get('thinking_for_ui', False):
@@ -267,26 +243,28 @@ def handle_new_query_submission(query_text: str):
         st.session_state.thinking_for_ui = True
         st.rerun()
 
-
-# --- Streamlit UI ---
+# --- Streamlit App Starts Here ---
 st.title("FiFi Co-Pilot 🚀 (LangGraph MCP Agent with Auto-Pruning Memory)")
 
-if 'agent_with_memory_tuple' not in st.session_state:
-    asyncio.run(ensure_agent_is_initialized())
+# --- Initialize agent resources ONCE at the beginning of the script using the new pattern ---
+if "components_loaded" not in st.session_state or not st.session_state.components_loaded:
+    print("@@@ App starting/restarting, components_loaded flag is not set or false. Calling load_agent_components_into_session.")
+    try:
+        asyncio.run(load_agent_components_into_session())
+        # Check if loading was successful
+        if not st.session_state.get("components_loaded"):
+            st.error("Failed to initialize agent components. The application may not function correctly.")
+            # You might want to st.stop() here if components are critical for any UI rendering
+    except Exception as e:
+        st.error(f"Failed to initialize agent components during app start: {e}")
+        print(f"@@@ EXCEPTION during initial asyncio.run(load_agent_components_into_session): {e}")
+        # Consider st.stop() or other error handling
+else:
+    print("@@@ App rerun, components_loaded flag is true. Components should be available in session state.")
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(str(message.get("content", "")))
 
-if st.session_state.get('thinking_for_ui', False):
-    with st.chat_message("assistant"):
-        st.markdown("⌛ FiFi is thinking...")
-
-if st.session_state.get('thinking_for_ui', False) and st.session_state.get('query_to_process') is not None:
-    query_to_run = st.session_state.query_to_process
-    st.session_state.query_to_process = None
-    asyncio.run(execute_agent_call_with_memory(query_to_run))
-
+# --- UI Rendering ---
+# Sidebar
 st.sidebar.markdown("## Quick Questions")
 preview_questions = [
     "Help me with my recipe for a new juice drink",
@@ -297,23 +275,21 @@ for question in preview_questions:
     if st.sidebar.button(question, key=f"preview_{question}", use_container_width=True):
         handle_new_query_submission(question)
 
-user_prompt = st.chat_input("Ask FiFi Co-Pilot...", key="main_chat_input",
-                            disabled=st.session_state.get('thinking_for_ui', False))
-if user_prompt:
-    handle_new_query_submission(user_prompt)
-
+st.sidebar.markdown("---")
 if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
     st.session_state.messages = []
     st.session_state.thinking_for_ui = False
     st.session_state.query_to_process = None
-    if 'agent_with_memory_tuple' in st.session_state:
-        del st.session_state.agent_with_memory_tuple
-
-    if 'pinecone_tool_name' in st.session_state: del st.session_state.pinecone_tool_name
-    if 'woocommerce_tool_names' in st.session_state: del st.session_state.woocommerce_tool_names
-    if 'all_tool_details_for_prompt' in st.session_state: del st.session_state.all_tool_details_for_prompt
-    # No UI token counter state to clear here.
-    get_agent_with_memory_tuple.clear()
+    
+    # Clear specific session state items related to the agent
+    for key in ["agent_executor", "memory_instance", 
+                "pinecone_tool_name", "woocommerce_tool_names", 
+                "all_tool_details_for_prompt", "components_loaded"]: # also clear the loaded flag
+        if key in st.session_state:
+            del st.session_state[key]
+            
+    initialize_agent_core_resources.clear() # Clear the cache 
+    print("@@@ Chat history cleared, cache cleared, session state for agent components cleared.")
     st.rerun()
 
 if st.session_state.messages:
@@ -329,6 +305,24 @@ if st.session_state.messages:
         mime="text/plain",
         use_container_width=True
     )
-
 st.sidebar.markdown("---")
 st.sidebar.info("💡 FiFi uses guided memory with auto-pruning and tool prioritization!")
+
+# Main chat area
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(str(message.get("content", "")))
+
+if st.session_state.get('thinking_for_ui', False):
+    with st.chat_message("assistant"):
+        st.markdown("⌛ FiFi is thinking...")
+
+if st.session_state.get('thinking_for_ui', False) and st.session_state.get('query_to_process') is not None:
+    query_to_run = st.session_state.query_to_process
+    st.session_state.query_to_process = None
+    asyncio.run(execute_agent_call_with_memory(query_to_run))
+
+user_prompt = st.chat_input("Ask FiFi Co-Pilot...", key="main_chat_input",
+                            disabled=st.session_state.get('thinking_for_ui', False))
+if user_prompt:
+    handle_new_query_submission(user_prompt)
