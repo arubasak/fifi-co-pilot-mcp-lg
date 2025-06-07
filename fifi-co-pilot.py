@@ -29,7 +29,8 @@ THREAD_ID = "fifi_streamlit_session"
 def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> int:
     if not messages: return 0
     try: encoding = tiktoken.get_encoding(model_encoding)
-    except Exception: encoding = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        encoding = tiktoken.get_encoding("cl100k_base")
     num_tokens = 0
     for message in messages:
         num_tokens += 4
@@ -58,58 +59,47 @@ def prune_history_if_needed(memory_instance: MemorySaver, thread_config: dict, c
         return True
     return False
 
-# --- Agent Initialization ---
-# This async function does the actual work. It's decorated with @st.cache_resource.
-@st.cache_resource(ttl=3600) 
-async def initialize_agent_core_resources():
-    print("@@@ ASYNC initialize_agent_core_resources: Starting actual resource initialization (cached)...")
+# ### <<< KEY CHANGE HERE: The robust, synchronous initialization pattern >>> ###
+
+# This is the async part that does the actual work. It is NOT decorated.
+async def run_async_initialization():
+    print("@@@ ASYNC run_async_initialization: Starting actual resource initialization...")
     client = MultiServerMCPClient({
         "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
         "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
     })
     tools = await client.get_tools()
-
     memory = MemorySaver()
     agent_executor = create_react_agent(llm, tools, checkpointer=memory)
     
-    print("@@@ ASYNC initialize_agent_core_resources: Initialization complete.")
-    return agent_executor, memory, tools
+    # Identify tools synchronously after they're fetched
+    pinecone_tool_name = "functions.get_context"
+    woocommerce_tool_names = []
+    all_tool_details = {}
+    for tool in tools:
+        all_tool_details[tool.name] = tool.description
+        if tool.name == "functions.get_context":
+            pinecone_tool_name = tool.name
+        elif "woocommerce" in tool.name.lower():
+            woocommerce_tool_names.append(tool.name)
 
-# This synchronous function is our single entry point for initialization.
-def load_and_store_agent_components():
-    if "components_loaded" not in st.session_state:
-        print("@@@ load_and_store: components_loaded flag not set. Calling asyncio.run()...")
-        try:
-            # Run the async function once and get all its results.
-            agent_executor, memory, tools = asyncio.run(initialize_agent_core_resources())
-            
-            # Store everything in session state.
-            st.session_state.agent_executor = agent_executor
-            st.session_state.memory_instance = memory
-            
-            # Identify tools and store their info here, synchronously.
-            st.session_state.pinecone_tool_name = "functions.get_context"
-            st.session_state.woocommerce_tool_names = []
-            st.session_state.all_tool_details_for_prompt = {}
+    print("@@@ ASYNC run_async_initialization: Initialization complete.")
+    return {
+        "agent_executor": agent_executor,
+        "memory_instance": memory,
+        "pinecone_tool_name": pinecone_tool_name,
+        "woocommerce_tool_names": woocommerce_tool_names,
+        "all_tool_details_for_prompt": all_tool_details
+    }
 
-            for tool in tools:
-                st.session_state.all_tool_details_for_prompt[tool.name] = tool.description
-                if tool.name == "functions.get_context":
-                    st.session_state.pinecone_tool_name = tool.name
-                elif "woocommerce" in tool.name.lower():
-                    st.session_state.woocommerce_tool_names.append(tool.name)
-
-            print(f"    Tools identified and stored in session state.")
-            st.session_state.components_loaded = True
-            print("@@@ load_and_store: Components loaded into session state successfully.")
-        
-        except Exception as e:
-            # This will catch the "cannot reuse already awaited coroutine" or any other init error.
-            print(f"@@@ ERROR during asyncio.run(initialize_agent_core_resources): {e}")
-            st.error(f"A critical error occurred during agent initialization. Please refresh the page. Error: {e}")
-            st.session_state.components_loaded = False
-            # We must stop the app if initialization fails.
-            st.stop()
+# This is the SYNCHRONOUS function that Streamlit will cache.
+# It internally calls asyncio.run() only ONCE when the cache is being created.
+@st.cache_resource(ttl=3600)
+def get_agent_components():
+    print("@@@ get_agent_components: Populating cache by running the async initialization...")
+    # This is the correct, safe, and robust way to bridge sync and async for one-time setup.
+    components = asyncio.run(run_async_initialization())
+    return components
 
 # --- Initialize session state (basic flags) ---
 if "messages" not in st.session_state: st.session_state.messages = []
@@ -117,9 +107,9 @@ if 'thinking_for_ui' not in st.session_state: st.session_state.thinking_for_ui =
 if 'query_to_process' not in st.session_state: st.session_state.query_to_process = None
 
 # --- System Prompt Definition ---
-def get_system_prompt():
-    pinecone_tool = st.session_state.get('pinecone_tool_name', "functions.get_context")
-    all_tool_details = st.session_state.get('all_tool_details_for_prompt', {})
+def get_system_prompt(agent_components):
+    pinecone_tool = agent_components['pinecone_tool_name']
+    all_tool_details = agent_components['all_tool_details_for_prompt']
     prompt = f"""You are FiFi, an expert AI assistant for 1-2-Taste. Your **sole purpose** is to assist users with inquiries related to 1-2-Taste's products, the food and beverage ingredients industry, food science topics relevant to 1-2-Taste's offerings, B2B inquiries, recipe development support using 1-2-Taste ingredients, and specific e-commerce functions related to 1-2-Taste's WooCommerce platform.
 
 **Core Mission:**
@@ -173,36 +163,32 @@ Answer the user's last query based on these instructions and the conversation hi
     return prompt
 
 # --- Async handler for user queries, using agent with memory ---
-async def execute_agent_call_with_memory(user_query: str):
+async def execute_agent_call_with_memory(user_query: str, agent_components: dict):
     assistant_reply = ""
     try:
-        if not st.session_state.get("components_loaded", False):
-            st.error("Agent is not ready. Please refresh the page.")
-            assistant_reply = "(Critical Error: Agent not initialized)"
+        agent_executor = agent_components["agent_executor"]
+        memory_instance = agent_components["memory_instance"]
+        
+        config = {"configurable": {"thread_id": THREAD_ID}}
+        system_prompt_content = get_system_prompt(agent_components)
+
+        prune_history_if_needed(
+            memory_instance, config, system_prompt_content,
+            MAX_HISTORY_TOKENS, MESSAGES_TO_KEEP_AFTER_PRUNING
+        )
+
+        current_turn_messages = [
+            {"role": "system", "content": system_prompt_content},
+            {"role": "user", "content": user_query}
+        ]
+        event = {"messages": current_turn_messages}
+        result = await agent_executor.ainvoke(event, config=config)
+
+        if isinstance(result, dict) and "messages" in result and result["messages"]:
+            assistant_reply = result["messages"][-1].content
         else:
-            agent_executor = st.session_state.agent_executor
-            memory_instance = st.session_state.memory_instance
-
-            config = {"configurable": {"thread_id": THREAD_ID}}
-            system_prompt_content = get_system_prompt()
-
-            was_pruned = prune_history_if_needed(
-                memory_instance, config, system_prompt_content,
-                MAX_HISTORY_TOKENS, MESSAGES_TO_KEEP_AFTER_PRUNING
-            )
-
-            current_turn_messages = [
-                {"role": "system", "content": system_prompt_content},
-                {"role": "user", "content": user_query}
-            ]
-            event = {"messages": current_turn_messages}
-            result = await agent_executor.ainvoke(event, config=config)
-
-            if isinstance(result, dict) and "messages" in result and result["messages"]:
-                assistant_reply = result["messages"][-1].content
-            else:
-                assistant_reply = f"(Error: Unexpected agent response format: {type(result)} - {result})"
-                st.error(f"Unexpected agent response: {result}")
+            assistant_reply = f"(Error: Unexpected agent response format: {type(result)} - {result})"
+            st.error(f"Unexpected agent response: {result}")
 
     except Exception as e:
         import traceback
@@ -225,11 +211,18 @@ def handle_new_query_submission(query_text: str):
 st.title("FiFi Co-Pilot 🚀 (LangGraph MCP Agent with Auto-Pruning Memory)")
 
 # --- Call the synchronous loader function at the start of the script ---
-load_and_store_agent_components()
+try:
+    agent_components = get_agent_components()
+    st.session_state.components_loaded = True
+except Exception as e:
+    st.error(f"Failed to initialize agent components. The app cannot continue. Please refresh. Error: {e}")
+    print(f"@@@ CRITICAL FAILURE during get_agent_components(): {e}")
+    st.session_state.components_loaded = False
+    st.stop() # Stop the app if initialization fails
+
 
 # --- UI Rendering ---
-# The rest of the UI should now safely assume that either the components are loaded
-# or the app has been stopped with an error during initialization.
+# Sidebar
 st.sidebar.markdown("## Quick Questions")
 preview_questions = [
     "Help me with my recipe for a new juice drink",
@@ -246,13 +239,13 @@ if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
     st.session_state.thinking_for_ui = False
     st.session_state.query_to_process = None
     
-    # Clear all session state keys related to the agent to trigger re-initialization on next run
-    for key in list(st.session_state.keys()):
-        if key not in ['messages', 'thinking_for_ui', 'query_to_process']:
-             del st.session_state[key]
-            
-    initialize_agent_core_resources.clear() 
-    print("@@@ Chat history cleared, cache cleared, session state for agent components cleared.")
+    # Clear the specific cache for this function
+    get_agent_components.clear() 
+    # Remove the loaded flag to force re-initialization on next run
+    if "components_loaded" in st.session_state:
+        del st.session_state["components_loaded"]
+    
+    print("@@@ Chat history cleared, cache cleared.")
     st.rerun()
 
 if st.session_state.messages:
@@ -281,15 +274,13 @@ if st.session_state.get('thinking_for_ui', False):
         st.markdown("⌛ FiFi is thinking...")
 
 if st.session_state.get('thinking_for_ui', False) and st.session_state.get('query_to_process') is not None:
-    # A simple check to ensure we don't process if init failed.
     if st.session_state.get("components_loaded"):
         query_to_run = st.session_state.query_to_process
         st.session_state.query_to_process = None
-        # This is now the ONLY place asyncio.run is called for agent interaction
-        asyncio.run(execute_agent_call_with_memory(query_to_run))
+        # This is now the ONLY place asyncio.run is called for per-query interaction
+        asyncio.run(execute_agent_call_with_memory(query_to_run, agent_components))
     else:
-        # If components aren't loaded, we shouldn't have gotten this far,
-        # but as a safeguard, we reset the thinking state.
+        st.error("Agent is not ready. Please refresh the page.")
         st.session_state.thinking_for_ui = False
         st.session_state.query_to_process = None
         st.rerun()
