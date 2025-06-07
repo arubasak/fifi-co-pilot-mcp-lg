@@ -9,7 +9,7 @@ from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # --- Constants for History Pruning ---
-MAX_HISTORY_TOKENS = 80000
+MAX_HISTORY_TOKENS = 90000
 MESSAGES_TO_KEEP_AFTER_PRUNING = 6
 TOKEN_MODEL_ENCODING = "cl100k_base"
 
@@ -67,10 +67,10 @@ def prune_history_if_needed(
         return True
     return False
 
-# --- Modified Agent Initialization and Access ---
+# --- Agent Initialization ---
 @st.cache_resource(ttl=3600) 
-async def initialize_agent_core_resources(): # Renamed
-    print("@@@ Initializing ALL agent core resources (cached)...")
+async def initialize_agent_components(): # Renamed for clarity
+    print("@@@ Initializing ALL agent components (cached function executing)...")
     client = MultiServerMCPClient(
         {
             "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
@@ -83,7 +83,6 @@ async def initialize_agent_core_resources(): # Renamed
     identified_woocommerce_tool_names = []
     identified_all_tool_details = {}
 
-    # print("--- Identifying Tools during resource initialization ---") # Less verbose
     for tool in tools:
         identified_all_tool_details[tool.name] = tool.description
         if tool.name == "functions.get_context":
@@ -91,44 +90,74 @@ async def initialize_agent_core_resources(): # Renamed
         elif "woocommerce" in tool.name.lower():
             identified_woocommerce_tool_names.append(tool.name)
     
-    # print(f"Confirmed Pinecone tool (init): {identified_pinecone_tool_name}") # Less verbose
-    # if not identified_woocommerce_tool_names: print("Warning: No WooCommerce tools identified (init).")
-    # else: print(f"Identified WooCommerce tools (init): {identified_woocommerce_tool_names}")
-    # print("-------------------------------------------------")
+    print(f"    Pinecone tool identified as: {identified_pinecone_tool_name}")
+    if not identified_woocommerce_tool_names: print("    Warning: No WooCommerce tools identified.")
+    # else: print(f"    Identified WooCommerce tools: {identified_woocommerce_tool_names}")
+
 
     memory = MemorySaver()
     agent_executor = create_react_agent(llm, tools, checkpointer=memory)
-    print("Agent with memory initialized successfully (cached).")
-    return agent_executor, memory, identified_pinecone_tool_name, identified_woocommerce_tool_names, identified_all_tool_details
+    print("@@@ Agent components initialization complete (cached function finished).")
+    return { # Return a dictionary for clarity
+        "agent_executor": agent_executor,
+        "memory_instance": memory,
+        "pinecone_tool_name": identified_pinecone_tool_name,
+        "woocommerce_tool_names": identified_woocommerce_tool_names,
+        "all_tool_details_for_prompt": identified_all_tool_details,
+    }
 
-async def load_agent_components_into_session():
-    if "components_loaded" not in st.session_state or not st.session_state.components_loaded: # Check flag
-        print("@@@ components_loaded flag not set or false, attempting to load agent components into session_state...")
+# --- Function to load components into session state ---
+# This function is NOT async itself. It calls the async cached function.
+def load_components():
+    if "components_loaded" not in st.session_state or not st.session_state.components_loaded:
+        print("@@@ load_components: components_loaded flag not set or false. Calling asyncio.run(initialize_agent_components()).")
         try:
-            agent_executor, memory, pinecone_name, woo_names, all_details = await initialize_agent_core_resources()
-            st.session_state.agent_executor = agent_executor
-            st.session_state.memory_instance = memory
-            st.session_state.pinecone_tool_name = pinecone_name
-            st.session_state.woocommerce_tool_names = woo_names
-            st.session_state.all_tool_details_for_prompt = all_details
-            st.session_state.components_loaded = True # Set flag after successful load
-            print("@@@ Agent components loaded into session state successfully.")
+            # asyncio.run() should be called here, once, to get the result of the cached async function
+            components = asyncio.run(initialize_agent_components())
+            st.session_state.agent_executor = components["agent_executor"]
+            st.session_state.memory_instance = components["memory_instance"]
+            st.session_state.pinecone_tool_name = components["pinecone_tool_name"]
+            st.session_state.woocommerce_tool_names = components["woocommerce_tool_names"]
+            st.session_state.all_tool_details_for_prompt = components["all_tool_details_for_prompt"]
+            st.session_state.components_loaded = True
+            print("@@@ load_components: Components loaded into session state successfully.")
+        except RuntimeError as e:
+            if "cannot enter context" in str(e).lower() or "already running" in str(e).lower():
+                print(f"@@@ load_components: asyncio.run error: {e}. Event loop might be managed by Streamlit differently. Trying direct call to cached function.")
+                # This case might occur if Streamlit is already managing an event loop for @st.cache_resource
+                # In such cases, Streamlit might execute the async function itself when the cached value is first requested.
+                # However, we need its result to populate session state.
+                # Forcing a direct call to a cached async function without await from a sync context is not standard.
+                # The primary goal is that `initialize_agent_components()` is run by Streamlit's cache mechanism.
+                # If this block is reached, it means our asyncio.run was problematic.
+                # Let's simply try to access the cached function. If it's not populated,
+                # an error will occur, but Streamlit should handle the first call.
+                # This path is less ideal because we can't easily populate session state *from* it synchronously.
+                st.error(f"Asyncio context error during initialization: {e}. Please refresh. If persists, check logs.")
+                st.session_state.components_loaded = False # Mark as not loaded
+            else:
+                print(f"@@@ load_components: UNEXPECTED RuntimeError: {e}")
+                st.error(f"Critical error during agent initialization: {e}")
+                st.session_state.components_loaded = False
+                raise # Re-raise other runtime errors
         except Exception as e:
-            print(f"@@@ ERROR during load_agent_components_into_session: {e}")
+            print(f"@@@ load_components: General error during initialize_agent_components: {e}")
             st.error(f"Critical error during agent initialization: {e}")
-            # Potentially stop the app or prevent further agent calls if init fails
-            st.session_state.components_loaded = False # Explicitly set to false on error
-            # raise # Optionally re-raise if you want the app to halt here
+            st.session_state.components_loaded = False
+            raise # Re-raise
+    else:
+        print("@@@ load_components: components_loaded flag is true. Components should be available.")
+
 
 # --- Initialize session state (basic flags) ---
 if "messages" not in st.session_state: st.session_state.messages = []
 if 'thinking_for_ui' not in st.session_state: st.session_state.thinking_for_ui = False
 if 'query_to_process' not in st.session_state: st.session_state.query_to_process = None
-# Tool names and other components will be set by load_agent_components_into_session
+# Tool names and other components will be set by load_components()
 
 # --- System Prompt Definition ---
 def get_system_prompt():
-    pinecone_tool = st.session_state.get('pinecone_tool_name', "functions.get_context") # Default if not loaded
+    pinecone_tool = st.session_state.get('pinecone_tool_name', "functions.get_context") 
     all_tool_details = st.session_state.get('all_tool_details_for_prompt', {})
     prompt = f"""You are FiFi, an expert AI assistant for 1-2-Taste. Your **sole purpose** is to assist users with inquiries related to 1-2-Taste's products, the food and beverage ingredients industry, food science topics relevant to 1-2-Taste's offerings, B2B inquiries, recipe development support using 1-2-Taste ingredients, and specific e-commerce functions related to 1-2-Taste's WooCommerce platform.
 
@@ -186,23 +215,21 @@ Answer the user's last query based on these instructions and the conversation hi
 async def execute_agent_call_with_memory(user_query: str):
     assistant_reply = ""
     try:
-        # Ensure components are loaded before trying to get them from session state
+        # Retrieve components from session state, ensure they are loaded
         if not st.session_state.get("components_loaded"):
-            print("@@@ execute_agent_call: Components not loaded, attempting to load now.")
-            await load_agent_components_into_session()
-            if not st.session_state.get("components_loaded"): # Check again
-                st.error("Critical error: Agent components could not be loaded for execute_agent_call.")
-                st.session_state.messages.append({"role": "assistant", "content": "(Error: Agent initialization failed, please refresh.)"})
-                st.session_state.thinking_for_ui = False
-                st.rerun() # Rerun to show the error message
-                return # Stop further execution in this call
+            print("@@@ execute_agent_call: FATAL - components not loaded before execution attempt.")
+            st.error("Agent is not ready. Please try refreshing the page or wait a moment.")
+            st.session_state.messages.append({"role": "assistant", "content": "(Critical Error: Agent not ready. Please refresh.)"})
+            st.session_state.thinking_for_ui = False
+            st.rerun()
+            return
 
         agent_executor = st.session_state.get("agent_executor")
         memory_instance = st.session_state.get("memory_instance")
 
         if agent_executor is None or memory_instance is None:
-            st.error("Agent or Memory could not be retrieved from session state after initialization attempt.")
-            assistant_reply = "(Error: Agent/Memory not properly available)"
+            st.error("Agent or Memory instance is missing from session state. This should not happen.")
+            assistant_reply = "(Error: Agent/Memory components missing)"
         else:
             config = {"configurable": {"thread_id": THREAD_ID}}
             system_prompt_content = get_system_prompt()
@@ -246,22 +273,8 @@ def handle_new_query_submission(query_text: str):
 # --- Streamlit App Starts Here ---
 st.title("FiFi Co-Pilot 🚀 (LangGraph MCP Agent with Auto-Pruning Memory)")
 
-# --- Initialize agent resources ONCE at the beginning of the script using the new pattern ---
-if "components_loaded" not in st.session_state or not st.session_state.components_loaded:
-    print("@@@ App starting/restarting, components_loaded flag is not set or false. Calling load_agent_components_into_session.")
-    try:
-        asyncio.run(load_agent_components_into_session())
-        # Check if loading was successful
-        if not st.session_state.get("components_loaded"):
-            st.error("Failed to initialize agent components. The application may not function correctly.")
-            # You might want to st.stop() here if components are critical for any UI rendering
-    except Exception as e:
-        st.error(f"Failed to initialize agent components during app start: {e}")
-        print(f"@@@ EXCEPTION during initial asyncio.run(load_agent_components_into_session): {e}")
-        # Consider st.stop() or other error handling
-else:
-    print("@@@ App rerun, components_loaded flag is true. Components should be available in session state.")
-
+# --- Initialize agent resources ONCE at the beginning of the script ---
+load_components() # Call the synchronous wrapper function
 
 # --- UI Rendering ---
 # Sidebar
@@ -281,14 +294,13 @@ if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
     st.session_state.thinking_for_ui = False
     st.session_state.query_to_process = None
     
-    # Clear specific session state items related to the agent
     for key in ["agent_executor", "memory_instance", 
                 "pinecone_tool_name", "woocommerce_tool_names", 
-                "all_tool_details_for_prompt", "components_loaded"]: # also clear the loaded flag
+                "all_tool_details_for_prompt", "components_loaded"]:
         if key in st.session_state:
             del st.session_state[key]
             
-    initialize_agent_core_resources.clear() # Clear the cache 
+    initialize_agent_components.clear() # Clear the cache 
     print("@@@ Chat history cleared, cache cleared, session state for agent components cleared.")
     st.rerun()
 
@@ -318,9 +330,19 @@ if st.session_state.get('thinking_for_ui', False):
         st.markdown("⌛ FiFi is thinking...")
 
 if st.session_state.get('thinking_for_ui', False) and st.session_state.get('query_to_process') is not None:
-    query_to_run = st.session_state.query_to_process
-    st.session_state.query_to_process = None
-    asyncio.run(execute_agent_call_with_memory(query_to_run))
+    # Ensure components are loaded before processing a query
+    if not st.session_state.get("components_loaded"):
+        print("@@@ Query processing: Components not loaded. This indicates an issue with initial load.")
+        st.error("Agent is not ready. Please refresh the page.")
+        # Optionally clear thinking_for_ui and query_to_process to prevent loop
+        st.session_state.thinking_for_ui = False
+        st.session_state.query_to_process = None
+        st.rerun()
+    else:
+        query_to_run = st.session_state.query_to_process
+        st.session_state.query_to_process = None
+        asyncio.run(execute_agent_call_with_memory(query_to_run))
+
 
 user_prompt = st.chat_input("Ask FiFi Co-Pilot...", key="main_chat_input",
                             disabled=st.session_state.get('thinking_for_ui', False))
