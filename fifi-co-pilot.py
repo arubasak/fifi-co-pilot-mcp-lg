@@ -30,7 +30,6 @@ def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> 
     if not messages: return 0
     try: encoding = tiktoken.get_encoding(model_encoding)
     except Exception:
-        print(f"Warning: Encoding {model_encoding} not found. Using 'cl100k_base'.")
         encoding = tiktoken.get_encoding("cl100k_base")
     num_tokens = 0
     for message in messages:
@@ -38,21 +37,16 @@ def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> 
         for key, value in message.items():
             if value is not None:
                 try: num_tokens += len(encoding.encode(str(value)))
-                except TypeError: print(f"Warning: Could not encode value of type {type(value)}.")
+                except TypeError: pass
     num_tokens += 2
     return num_tokens
 
-def prune_history_if_needed(
-    memory_instance: MemorySaver, thread_config: dict, current_system_prompt_content: str, 
-    max_tokens: int, keep_last_n_interactions: int 
-):
+def prune_history_if_needed(memory_instance: MemorySaver, thread_config: dict, current_system_prompt_content: str, max_tokens: int, keep_last_n_interactions: int):
     checkpoint_value = memory_instance.get(thread_config)
-    if not checkpoint_value or "messages" not in checkpoint_value or \
-       not isinstance(checkpoint_value.get("messages"), list):
-        return False 
-    current_messages_in_history = checkpoint_value["messages"]
-    if not current_messages_in_history:
+    if not checkpoint_value or "messages" not in checkpoint_value or not isinstance(checkpoint_value.get("messages"), list):
         return False
+    current_messages_in_history = checkpoint_value["messages"]
+    if not current_messages_in_history: return False
     current_token_count = count_tokens(current_messages_in_history)
     if current_token_count > max_tokens:
         print(f"INFO: History token count ({current_token_count}) > max ({max_tokens}). Pruning...")
@@ -60,93 +54,197 @@ def prune_history_if_needed(
         pruned_user_assistant_messages = user_assistant_messages[-keep_last_n_interactions:]
         new_history_messages = [{"role": "system", "content": current_system_prompt_content}]
         new_history_messages.extend(pruned_user_assistant_messages)
-        new_checkpoint_value_to_put = {"messages": new_history_messages}
-        memory_instance.put(thread_config, new_checkpoint_value_to_put)
-        pruned_token_count = count_tokens(new_history_messages)
-        print(f"INFO: History pruned. New token count: {pruned_token_count}.")
+        memory_instance.put(thread_config, {"messages": new_history_messages})
         return True
     return False
 
-# --- Agent Initialization ---
-@st.cache_resource(ttl=3600) 
-async def initialize_agent_components(): # Renamed for clarity
-    print("@@@ Initializing ALL agent components (cached function executing)...")
-    client = MultiServerMCPClient(
-        {
-            "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
-            "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
-        }
-    )
+@st.cache_resource(ttl=3600)
+async def initialize_agent_components():
+    client = MultiServerMCPClient({
+        "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
+        "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
+    })
     tools = await client.get_tools()
 
-    identified_pinecone_tool_name = "functions.get_context"
-    identified_woocommerce_tool_names = []
-    identified_all_tool_details = {}
+    pinecone_tool_name = "functions.get_context"
+    woocommerce_tool_names = []
+    all_tool_details = {}
 
     for tool in tools:
-        identified_all_tool_details[tool.name] = tool.description
-        if tool.name == "functions.get_context":
-            identified_pinecone_tool_name = tool.name
-        elif "woocommerce" in tool.name.lower():
-            identified_woocommerce_tool_names.append(tool.name)
-    
-    print(f"    Pinecone tool identified as: {identified_pinecone_tool_name}")
-    if not identified_woocommerce_tool_names: print("    Warning: No WooCommerce tools identified.")
-    # else: print(f"    Identified WooCommerce tools: {identified_woocommerce_tool_names}")
-
+        all_tool_details[tool.name] = tool.description
+        if "woocommerce" in tool.name.lower():
+            woocommerce_tool_names.append(tool.name)
 
     memory = MemorySaver()
     agent_executor = create_react_agent(llm, tools, checkpointer=memory)
-    print("@@@ Agent components initialization complete (cached function finished).")
-    return { # Return a dictionary for clarity
+    return {
         "agent_executor": agent_executor,
         "memory_instance": memory,
-        "pinecone_tool_name": identified_pinecone_tool_name,
-        "woocommerce_tool_names": identified_woocommerce_tool_names,
-        "all_tool_details_for_prompt": identified_all_tool_details,
+        "pinecone_tool_name": pinecone_tool_name,
+        "woocommerce_tool_names": woocommerce_tool_names,
+        "all_tool_details_for_prompt": all_tool_details
     }
 
-# --- Function to load components into session state ---
-# This function is NOT async itself. It calls the async cached function.
+# ✅ Updated load_components() to avoid asyncio.run()
 def load_components():
     if "components_loaded" not in st.session_state or not st.session_state.components_loaded:
-        print("@@@ load_components: components_loaded flag not set or false. Calling asyncio.run(initialize_agent_components()).")
+        print("@@@ load_components: components_loaded flag not set or false. Calling initialize_agent_components() directly.")
         try:
-            # asyncio.run() should be called here, once, to get the result of the cached async function
-            components = asyncio.run(initialize_agent_components())
-            st.session_state.agent_executor = components["agent_executor"]
-            st.session_state.memory_instance = components["memory_instance"]
-            st.session_state.pinecone_tool_name = components["pinecone_tool_name"]
-            st.session_state.woocommerce_tool_names = components["woocommerce_tool_names"]
-            st.session_state.all_tool_details_for_prompt = components["all_tool_details_for_prompt"]
-            st.session_state.components_loaded = True
-            print("@@@ load_components: Components loaded into session state successfully.")
-        except RuntimeError as e:
-            if "cannot enter context" in str(e).lower() or "already running" in str(e).lower():
-                print(f"@@@ load_components: asyncio.run error: {e}. Event loop might be managed by Streamlit differently. Trying direct call to cached function.")
-                # This case might occur if Streamlit is already managing an event loop for @st.cache_resource
-                # In such cases, Streamlit might execute the async function itself when the cached value is first requested.
-                # However, we need its result to populate session state.
-                # Forcing a direct call to a cached async function without await from a sync context is not standard.
-                # The primary goal is that `initialize_agent_components()` is run by Streamlit's cache mechanism.
-                # If this block is reached, it means our asyncio.run was problematic.
-                # Let's simply try to access the cached function. If it's not populated,
-                # an error will occur, but Streamlit should handle the first call.
-                # This path is less ideal because we can't easily populate session state *from* it synchronously.
-                st.error(f"Asyncio context error during initialization: {e}. Please refresh. If persists, check logs.")
-                st.session_state.components_loaded = False # Mark as not loaded
+            components_future = initialize_agent_components()
+            if hasattr(components_future, "__await__"):
+                st.warning("Initializing agent components, please wait a moment...")
+                st.stop()
             else:
-                print(f"@@@ load_components: UNEXPECTED RuntimeError: {e}")
-                st.error(f"Critical error during agent initialization: {e}")
-                st.session_state.components_loaded = False
-                raise # Re-raise other runtime errors
+                components = components_future
+                st.session_state.agent_executor = components["agent_executor"]
+                st.session_state.memory_instance = components["memory_instance"]
+                st.session_state.pinecone_tool_name = components["pinecone_tool_name"]
+                st.session_state.woocommerce_tool_names = components["woocommerce_tool_names"]
+                st.session_state.all_tool_details_for_prompt = components["all_tool_details_for_prompt"]
+                st.session_state.components_loaded = True
+                print("@@@ load_components: Components loaded into session state successfully.")
         except Exception as e:
-            print(f"@@@ load_components: General error during initialize_agent_components: {e}")
             st.error(f"Critical error during agent initialization: {e}")
             st.session_state.components_loaded = False
-            raise # Re-raise
+            raise
     else:
         print("@@@ load_components: components_loaded flag is true. Components should be available.")
+
+# The rest of your script (system prompt, execute_agent_call_with_memory, handle_new_query_submission, UI) remains unchanged.
+# Use load_components() as you have been.
+
+# Example usage:
+if "messages" not in st.session_state: st.session_state.messages = []
+if "thinking_for_ui" not in st.session_state: st.session_state.thinking_for_ui = False
+if "query_to_process" not in st.session_state: st.session_state.query_to_process = None
+
+load_import streamlit as st
+import datetime
+import asyncio
+import tiktoken
+
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_openai import ChatOpenAI
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+# --- Constants for History Pruning ---
+MAX_HISTORY_TOKENS = 90000
+MESSAGES_TO_KEEP_AFTER_PRUNING = 6
+TOKEN_MODEL_ENCODING = "cl100k_base"
+
+# --- Load environment variables from secrets ---
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
+MCP_PINECONE_URL = st.secrets.get("MCP_PINECONE_URL")
+MCP_PINECONE_API_KEY = st.secrets.get("MCP_PINECONE_API_KEY")
+MCP_PIPEDREAM_URL = st.secrets.get("MCP_PIPEDREAM_URL")
+
+if not all([OPENAI_API_KEY, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREAM_URL]):
+    st.error("One or more secrets are missing. Please configure them in Streamlit secrets.")
+    st.stop()
+
+llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.2)
+THREAD_ID = "fifi_streamlit_session"
+
+def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> int:
+    if not messages: return 0
+    try: encoding = tiktoken.get_encoding(model_encoding)
+    except Exception:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    num_tokens = 0
+    for message in messages:
+        num_tokens += 4
+        for key, value in message.items():
+            if value is not None:
+                try: num_tokens += len(encoding.encode(str(value)))
+                except TypeError: pass
+    num_tokens += 2
+    return num_tokens
+
+def prune_history_if_needed(memory_instance: MemorySaver, thread_config: dict, current_system_prompt_content: str, max_tokens: int, keep_last_n_interactions: int):
+    checkpoint_value = memory_instance.get(thread_config)
+    if not checkpoint_value or "messages" not in checkpoint_value or not isinstance(checkpoint_value.get("messages"), list):
+        return False
+    current_messages_in_history = checkpoint_value["messages"]
+    if not current_messages_in_history: return False
+    current_token_count = count_tokens(current_messages_in_history)
+    if current_token_count > max_tokens:
+        print(f"INFO: History token count ({current_token_count}) > max ({max_tokens}). Pruning...")
+        user_assistant_messages = [m for m in current_messages_in_history if m.get("role") != "system"]
+        pruned_user_assistant_messages = user_assistant_messages[-keep_last_n_interactions:]
+        new_history_messages = [{"role": "system", "content": current_system_prompt_content}]
+        new_history_messages.extend(pruned_user_assistant_messages)
+        memory_instance.put(thread_config, {"messages": new_history_messages})
+        return True
+    return False
+
+@st.cache_resource(ttl=3600)
+async def initialize_agent_components():
+    client = MultiServerMCPClient({
+        "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
+        "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
+    })
+    tools = await client.get_tools()
+
+    pinecone_tool_name = "functions.get_context"
+    woocommerce_tool_names = []
+    all_tool_details = {}
+
+    for tool in tools:
+        all_tool_details[tool.name] = tool.description
+        if "woocommerce" in tool.name.lower():
+            woocommerce_tool_names.append(tool.name)
+
+    memory = MemorySaver()
+    agent_executor = create_react_agent(llm, tools, checkpointer=memory)
+    return {
+        "agent_executor": agent_executor,
+        "memory_instance": memory,
+        "pinecone_tool_name": pinecone_tool_name,
+        "woocommerce_tool_names": woocommerce_tool_names,
+        "all_tool_details_for_prompt": all_tool_details
+    }
+
+# ✅ Updated load_components() to avoid asyncio.run()
+def load_components():
+    if "components_loaded" not in st.session_state or not st.session_state.components_loaded:
+        print("@@@ load_components: components_loaded flag not set or false. Calling initialize_agent_components() directly.")
+        try:
+            components_future = initialize_agent_components()
+            if hasattr(components_future, "__await__"):
+                st.warning("Initializing agent components, please wait a moment...")
+                st.stop()
+            else:
+                components = components_future
+                st.session_state.agent_executor = components["agent_executor"]
+                st.session_state.memory_instance = components["memory_instance"]
+                st.session_state.pinecone_tool_name = components["pinecone_tool_name"]
+                st.session_state.woocommerce_tool_names = components["woocommerce_tool_names"]
+                st.session_state.all_tool_details_for_prompt = components["all_tool_details_for_prompt"]
+                st.session_state.components_loaded = True
+                print("@@@ load_components: Components loaded into session state successfully.")
+        except Exception as e:
+            st.error(f"Critical error during agent initialization: {e}")
+            st.session_state.components_loaded = False
+            raise
+    else:
+        print("@@@ load_components: components_loaded flag is true. Components should be available.")
+
+# The rest of your script (system prompt, execute_agent_call_with_memory, handle_new_query_submission, UI) remains unchanged.
+# Use load_components() as you have been.
+
+# Example usage:
+if "messages" not in st.session_state: st.session_state.messages = []
+if "thinking_for_ui" not in st.session_state: st.session_state.thinking_for_ui = False
+if "query_to_process" not in st.session_state: st.session_state.query_to_process = None
+
+load_components()
+
+# ... (rest of your existing Streamlit app and UI logic remains untouched)
+
+
+# ... (rest of your existing Streamlit app and UI logic remains untouched)
+
 
 
 # --- Initialize session state (basic flags) ---
