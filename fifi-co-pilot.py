@@ -299,6 +299,15 @@ def handle_new_query_submission(query_text: str):
 # --- Streamlit App Starts Here ---
 st.title("FiFi Co-Pilot 🚀 (Auto-Summarizing Memory)")
 
+# --- Initialize session state (basic flags) ---
+# It's good practice to ensure these are at the very top of script execution,
+# before any possibility of reading from them for UI rendering or logic.
+if "messages" not in st.session_state: st.session_state.messages = []
+if 'thinking_for_ui' not in st.session_state: st.session_state.thinking_for_ui = False
+if 'query_to_process' not in st.session_state: st.session_state.query_to_process = None
+if 'components_loaded' not in st.session_state: st.session_state.components_loaded = False
+
+
 try:
     agent_components = get_agent_components()
     st.session_state.components_loaded = True
@@ -337,7 +346,8 @@ if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
     st.rerun()
 
 # Main chat area
-for message in st.session_state.messages:
+# This is the line that caused the error. Using .get() as a defensive measure.
+for message in st.session_state.get("messages", []):
     with st.chat_message(message["role"]):
         st.markdown(str(message.get("content", "")))
 
