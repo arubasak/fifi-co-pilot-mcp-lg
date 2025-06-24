@@ -2,28 +2,35 @@ import streamlit as st
 import datetime
 import asyncio
 import tiktoken
+import os
 
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-# --- Constants for History Pruning ---
-MAX_HISTORY_TOKENS = 90000
-MESSAGES_TO_KEEP_AFTER_PRUNING = 6
+# --- Constants for History Summarization ---
+# When the *conversational history* (user/assistant messages only)
+# exceeds this, older parts will be summarized.
+SUMMARIZE_THRESHOLD_TOKENS = 4000
+
+# Number of recent user/assistant messages to keep raw (unsummarized).
+# 12 messages means 6 user and 6 assistant turns (user-assistant pair counts as 2 messages).
+MESSAGES_TO_KEEP_AFTER_SUMMARIZATION = 12
+
 TOKEN_MODEL_ENCODING = "cl100k_base"
 
 # --- Load environment variables from secrets ---
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
-MCP_PINECONE_URL = st.secrets.get("MCP_PINECONE_URL")
-MCP_PINECONE_API_KEY = st.secrets.get("MCP_PINECONE_API_KEY")
-MCP_PIPEDREAM_URL = st.secrets.get("MCP_PIPEDREAM_URL")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+MCP_PINECONE_URL = os.environ.get("MCP_PINECONE_URL")
+MCP_PINECONE_API_KEY = os.environ.get("MCP_PINECONE_API_KEY")
+MCP_PIPEDREAM_URL = os.environ.get("MCP_PIPEDREAM_URL")
 
 if not all([OPENAI_API_KEY, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREAM_URL]):
     st.error("One or more secrets are missing. Please configure them in Streamlit secrets.")
     st.stop()
 
-llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.2)
+llm = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY, temperature=0.2)
 THREAD_ID = "fifi_streamlit_session"
 
 def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> int:
@@ -33,30 +40,78 @@ def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> 
         encoding = tiktoken.get_encoding("cl100k_base")
     num_tokens = 0
     for message in messages:
+        # Each message follows <|start|><|im_start|>role\ncontent<|end|><|im_end|>
+        # This roughly accounts for role, start/end tokens
         num_tokens += 4
         for key, value in message.items():
             if value is not None:
-                try: num_tokens += len(encoding.encode(str(value)))
-                except TypeError: pass
-    num_tokens += 2
+                try: 
+                    # Convert non-string types to string for encoding
+                    num_tokens += len(encoding.encode(str(value)))
+                except TypeError: 
+                    # Fallback for complex types, though string conversion should handle most
+                    pass
+    num_tokens += 2 # Every reply is primed with <|start|>assistant<|message|>
     return num_tokens
 
-def prune_history_if_needed(memory_instance: MemorySaver, thread_config: dict, current_system_prompt_content: str, max_tokens: int, keep_last_n_interactions: int):
+# --- NEW: Function to summarize history if needed ---
+async def summarize_history_if_needed(
+    memory_instance: MemorySaver,
+    thread_config: dict,
+    current_system_prompt_content: str,
+    summarize_threshold_tokens: int,
+    keep_last_n_interactions: int,
+    llm_for_summary: ChatOpenAI # Pass the LLM instance for summarization
+):
     checkpoint_value = memory_instance.get(thread_config)
     if not checkpoint_value or "messages" not in checkpoint_value or not isinstance(checkpoint_value.get("messages"), list):
         return False
     current_messages_in_history = checkpoint_value["messages"]
     if not current_messages_in_history: return False
-    current_token_count = count_tokens(current_messages_in_history)
-    if current_token_count > max_tokens:
-        print(f"INFO: History token count ({current_token_count}) > max ({max_tokens}). Pruning...")
-        user_assistant_messages = [m for m in current_messages_in_history if m.get("role") != "system"]
-        pruned_user_assistant_messages = user_assistant_messages[-keep_last_n_interactions:]
-        new_history_messages = [{"role": "system", "content": current_system_prompt_content}]
-        new_history_messages.extend(pruned_user_assistant_messages)
-        memory_instance.put(thread_config, {"messages": new_history_messages})
-        print(f"INFO: History pruned. New token count: {count_tokens(new_history_messages)}.")
-        return True
+
+    # Filter out any system messages potentially stored in the checkpoint's message history
+    # The current_system_prompt_content will be explicitly prepended anyway.
+    conversational_messages = [m for m in current_messages_in_history if m.get("role") in ["user", "assistant"]]
+
+    current_token_count_conv_only = count_tokens(conversational_messages)
+
+    if current_token_count_conv_only > summarize_threshold_tokens:
+        print(f"INFO: Conversational history token count ({current_token_count_conv_only}) > threshold ({summarize_threshold_tokens}). Summarizing...")
+
+        # Ensure we have enough messages to keep raw, otherwise don't attempt to summarize beyond them
+        if len(conversational_messages) <= keep_last_n_interactions:
+            print(f"INFO: Not enough conversational messages ({len(conversational_messages)}) to summarize beyond the 'keep_last_n_interactions' ({keep_last_n_interactions}) count. Skipping summarization.")
+            return False
+
+        messages_to_summarize = conversational_messages[:-keep_last_n_interactions]
+        messages_to_keep_raw = conversational_messages[-keep_last_n_interactions:]
+
+        if messages_to_summarize:
+            # Construct summarization prompt
+            summarization_prompt_messages = [
+                {"role": "system", "content": "Please summarize the following conversation history concisely, focusing on key topics, user requests, information provided by the assistant, and any resolutions or open questions. The summary should capture the essence of the discussion for continuity. Maintain a neutral and objective tone, suitable for an AI assistant's internal memory."},
+                {"role": "user", "content": "\n".join([f"{m.get('role', '').capitalize()}: {m.get('content', '')}" for m in messages_to_summarize])}
+            ]
+
+            try:
+                # Call LLM to summarize
+                summary_response = await llm_for_summary.ainvoke(summarization_prompt_messages)
+                summary_content = summary_response.content
+                print(f"DEBUG: Generated Summary: {summary_content[:150]}...") # Print first 150 chars of summary
+            except Exception as e:
+                print(f"ERROR: Failed to generate summary: {e}")
+                # Fallback: If summarization fails, create a simple message or handle as appropriate.
+                # For robustness, you might consider trimming here as a last resort.
+                summary_content = "Previous conversation context lost due to summarization error."
+                
+            # Reconstruct the new history for the checkpoint
+            new_history_messages = [{"role": "system", "content": current_system_prompt_content}]
+            new_history_messages.append({"role": "system", "content": f"Previous conversation summary: {summary_content}"})
+            new_history_messages.extend(messages_to_keep_raw)
+            
+            memory_instance.put(thread_config, {"messages": new_history_messages})
+            print(f"INFO: History summarized. New token count: {count_tokens(new_history_messages)}.")
+            return True
     return False
 
 # ### <<< KEY CHANGE HERE: The robust, synchronous initialization pattern >>> ###
@@ -73,7 +128,7 @@ async def run_async_initialization():
     agent_executor = create_react_agent(llm, tools, checkpointer=memory)
     
     # Identify tools synchronously after they're fetched
-    pinecone_tool_name = "functions.get_context"
+    pinecone_tool_name = "functions.get_context" # Default, will be updated if found
     woocommerce_tool_names = []
     all_tool_details = {}
     for tool in tools:
@@ -89,7 +144,8 @@ async def run_async_initialization():
         "memory_instance": memory,
         "pinecone_tool_name": pinecone_tool_name,
         "woocommerce_tool_names": woocommerce_tool_names,
-        "all_tool_details_for_prompt": all_tool_details
+        "all_tool_details_for_prompt": all_tool_details,
+        "llm_for_summary": llm # <--- Pass the LLM for summarization here
     }
 
 # This is the SYNCHRONOUS function that Streamlit will cache.
@@ -168,13 +224,16 @@ async def execute_agent_call_with_memory(user_query: str, agent_components: dict
     try:
         agent_executor = agent_components["agent_executor"]
         memory_instance = agent_components["memory_instance"]
-        
+        llm_for_summary = agent_components["llm_for_summary"] # Get LLM for summarization
+
         config = {"configurable": {"thread_id": THREAD_ID}}
         system_prompt_content = get_system_prompt(agent_components)
 
-        prune_history_if_needed(
+        # --- REPLACED: prune_history_if_needed with summarize_history_if_needed ---
+        await summarize_history_if_needed(
             memory_instance, config, system_prompt_content,
-            MAX_HISTORY_TOKENS, MESSAGES_TO_KEEP_AFTER_PRUNING
+            SUMMARIZE_THRESHOLD_TOKENS, MESSAGES_TO_KEEP_AFTER_SUMMARIZATION,
+            llm_for_summary # Pass the LLM
         )
 
         current_turn_messages = [
@@ -208,7 +267,7 @@ def handle_new_query_submission(query_text: str):
         st.rerun()
 
 # --- Streamlit App Starts Here ---
-st.title("FiFi Co-Pilot 🚀 (LangGraph MCP Agent with Auto-Pruning Memory)")
+st.title("FiFi Co-Pilot 🚀 (LangGraph MCP Agent with Auto-Summarizing Memory)")
 
 # --- Call the synchronous loader function at the start of the script ---
 try:
