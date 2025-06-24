@@ -45,6 +45,8 @@ def get_system_prompt_content_string(agent_components_for_prompt=None):
 
     pinecone_tool = agent_components_for_prompt['pinecone_tool_name']
     all_tool_details = agent_components_for_prompt['all_tool_details_for_prompt']
+    
+    # --- MODIFICATION IS HERE ---
     prompt = f"""You are FiFi, an expert AI assistant for 1-2-Taste. Your **sole purpose** is to assist users with inquiries related to 1-2-Taste's products, the food and beverage ingredients industry, food science topics relevant to 1-2-Taste's offerings, B2B inquiries, recipe development support using 1-2-Taste ingredients, and specific e-commerce functions related to 1-2-Taste's WooCommerce platform.
 
 **Core Mission:**
@@ -57,6 +59,10 @@ def get_system_prompt_content_string(agent_components_for_prompt=None):
 1.  **Primary Product & Industry Information Tool (Internally known as `{pinecone_tool}`):**
     *   For ANY query that could relate to 1-2-Taste product details, ingredients, flavors, availability, specifications, recipes, applications, food industry trends relevant to 1-2-Taste, or any information found within the 1-2-Taste catalog or relevant to its business, you **MUST ALWAYS PRIORITIZE** using this specialized tool (internally, its name is `{pinecone_tool}`). Its description is: "{all_tool_details.get(pinecone_tool, 'Retrieves relevant document snippets from the assistant knowledge base.')}" This is your main and most reliable knowledge source for product-related questions.
     *   If a query is ambiguous but might be product-related (e.g., "tell me about vanilla"), assume it is about 1-2-Taste's context and use this tool first.
+    *   **To manage token usage and control the amount of context returned, you MUST include the `top_k` and `snippet_size` parameters in your arguments. Use the following values:**
+        *   `top_k`: 10
+        *   `snippet_size`: 2048
+    *   **For example, a correct tool call would look like:** `get_context(query='some query about ingredients', top_k=10, snippet_size=1024)`
 
 2.  **E-commerce and Order Management Tools (Internally, these are your WooCommerce tools like `functions.WOOCOMMERCE-GET-ORDER`, etc.):**
     *   You should **ONLY** use one of these e-commerce tools if the user's query EXPLICITLY mentions "WooCommerce", "orders", "my order", "customer accounts", "shipping status", "store management", "cart issues", or other clearly WooCommerce-specific administrative or e-commerce tasks relevant to 1-2-Taste that map to the specific functions of these tools.
@@ -130,20 +136,15 @@ async def summarize_history_if_needed(
     current_stored_messages = checkpoint.get("messages", []) if checkpoint else []
     
     # 1. Filter out all occurrences of the MAIN system prompt from the stored history.
-    #    These are the redundant ones from previous turns that the checkpointer might have captured.
     cleaned_messages = []
     for m in current_stored_messages:
-        # Check if it's a SystemMessage and its content matches our main system prompt string
         if isinstance(m, SystemMessage) and m.content == main_system_prompt_content_str:
-            continue # Skip this message
+            continue
         cleaned_messages.append(m)
     
-    # The 'cleaned_messages' now contain only conversational turns and explicit summary messages.
     conversational_messages_only = cleaned_messages
-
     current_token_count = count_tokens(conversational_messages_only)
 
-    # --- Debugging output for Streamlit sidebar ---
     st.sidebar.markdown(f"**Conv. Tokens (w/ summaries):** `{current_token_count}` / `{summarize_threshold_tokens}`")
     st.sidebar.markdown(f"**Total Stored Messages (raw):** `{len(current_stored_messages)}`")
     st.sidebar.markdown(f"**Cleaned Conv. Messages:** `{len(conversational_messages_only)}`")
@@ -152,7 +153,6 @@ async def summarize_history_if_needed(
         st.info(f"Summarization Triggered: Conversational history ({current_token_count} tokens) > threshold ({summarize_threshold_tokens}).")
         print(f"INFO: Summarization Triggered. History ({current_token_count}) > threshold ({summarize_threshold_tokens}).")
 
-        # Ensure we have enough messages to summarize beyond the 'keep raw' count
         if len(conversational_messages_only) <= keep_last_n_interactions:
             print("INFO: Not enough messages to summarize beyond the 'keep raw' count. Skipping summarization.")
             st.info(f"Skipping summarization: Not enough conversational messages ({len(conversational_messages_only)}) to summarize beyond the 'keep_last_n_interactions' ({keep_last_n_interactions}) count.")
@@ -165,9 +165,8 @@ async def summarize_history_if_needed(
         st.sidebar.markdown(f"**Messages to Keep Raw:** `{len(messages_to_keep_raw)}`")
 
         if messages_to_summarize:
-            # Construct summarization prompt
             summarization_prompt_messages = [
-                SystemMessage(content="Please summarize the following conversation history concisely. Focus on key topics, user questions, assistant responses, and any resolutions or open questions. The summary should capture the essence of the discussion for continuity. Maintain a neutral and objective tone, suitable for an AI assistant's internal memory. Do not add salutations or conversational filler."),
+                SystemMessage(content="Please summarize the following conversation history concisely..."),
                 HumanMessage(content="\n".join([f"{m.type.capitalize()}: {m.content}" for m in messages_to_summarize]))
             ]
             
@@ -177,21 +176,17 @@ async def summarize_history_if_needed(
                 st.info("Summary generated successfully and history updated.")
                 print(f"DEBUG: Generated Summary: {summary_content[:150]}...")
                 
-                # The new history to be stored in the checkpointer is ONLY the summary + recent raw messages
-                # Crucially, the main system prompt is NOT included here.
                 new_messages_for_checkpoint = [SystemMessage(content=f"Previous conversation summary: {summary_content}")] + messages_to_keep_raw
                 
-                # Update the checkpoint with the new summarized history
-                # If checkpoint was empty, create it.
                 if checkpoint is None:
-                    checkpoint = {"messages": []} # Initialize if it was None
+                    checkpoint = {"messages": []}
                 checkpoint["messages"] = new_messages_for_checkpoint
                 memory_instance.put(thread_config, checkpoint)
-                print(f"INFO: Memory checkpoint updated with summarized history. New stored tokens (excluding main system prompt): {count_tokens(new_messages_for_checkpoint)}")
+                print(f"INFO: Memory checkpoint updated with summarized history. New stored tokens: {count_tokens(new_messages_for_checkpoint)}")
                 return True
 
             except Exception as e:
-                st.error(f"Failed to generate summary: {e}. Conversation context may be incomplete.")
+                st.error(f"Failed to generate summary: {e}")
                 print(f"ERROR: Failed to generate summary: {e}")
                 import traceback
                 print(f"Traceback: {traceback.format_exc()}")
@@ -211,13 +206,11 @@ async def run_async_initialization():
     pinecone_tool_name = "functions.get_context"
     all_tool_details = {tool.name: tool.description for tool in tools}
 
-    # Get system prompt content string once during initialization
     system_prompt_content_value = get_system_prompt_content_string({
         'pinecone_tool_name': pinecone_tool_name,
         'all_tool_details_for_prompt': all_tool_details
     })
 
-    # Initialize create_react_agent WITHOUT messages_modifier
     agent_executor = create_react_agent(llm, tools, checkpointer=memory)
     print("@@@ ASYNC run_async_initialization: Initialization complete.")
     
@@ -225,7 +218,7 @@ async def run_async_initialization():
         "agent_executor": agent_executor,
         "memory_instance": memory,
         "llm_for_summary": llm,
-        "main_system_prompt_content_str": system_prompt_content_value # Pass the exact string for filtering
+        "main_system_prompt_content_str": system_prompt_content_value
     }
 
 # --- Synchronous, cached function for Streamlit ---
@@ -241,8 +234,6 @@ async def execute_agent_call_with_memory(user_query: str, agent_components: dict
         config = {"configurable": {"thread_id": THREAD_ID}}
         main_system_prompt_content_str = agent_components["main_system_prompt_content_str"]
 
-        # 1. Summarize history if needed, AND clean up any duplicate system prompts
-        #    that might have accidentally been saved in previous turns.
         await summarize_history_if_needed(
             agent_components["memory_instance"], config,
             main_system_prompt_content_str,
@@ -250,25 +241,15 @@ async def execute_agent_call_with_memory(user_query: str, agent_components: dict
             agent_components["llm_for_summary"]
         )
 
-        # 2. Retrieve the *current, cleaned, and potentially summarized* history from the checkpointer.
-        #    This history will NOT contain the main system prompt due to the filtering above.
         current_checkpoint = agent_components["memory_instance"].get(config)
         history_messages = current_checkpoint.get("messages", []) if current_checkpoint else []
 
-        # 3. Construct the full list of messages to send to the LLM for *this specific turn*.
-        #    This includes:
-        #    - ONE copy of the main system prompt (always first, as a SystemMessage).
-        #    - The cleaned and summarized conversational history.
-        #    - The current user query.
         event_messages = [SystemMessage(content=main_system_prompt_content_str)] + history_messages + [HumanMessage(content=user_query)]
 
-        # 4. Invoke the agent with this complete message list.
         event = {"messages": event_messages}
         result = await agent_components["agent_executor"].ainvoke(event, config=config)
         
         if isinstance(result, dict) and "messages" in result and result["messages"]:
-            # LangGraph's ainvoke result contains the full message history up to the final AI message
-            # We want the content of the very last AI message.
             for msg in reversed(result["messages"]):
                 if isinstance(msg, AIMessage):
                     assistant_reply = msg.content
@@ -299,14 +280,10 @@ def handle_new_query_submission(query_text: str):
 # --- Streamlit App Starts Here ---
 st.title("FiFi Co-Pilot 🚀 (Auto-Summarizing Memory)")
 
-# --- Initialize session state (basic flags) ---
-# It's good practice to ensure these are at the very top of script execution,
-# before any possibility of reading from them for UI rendering or logic.
 if "messages" not in st.session_state: st.session_state.messages = []
 if 'thinking_for_ui' not in st.session_state: st.session_state.thinking_for_ui = False
 if 'query_to_process' not in st.session_state: st.session_state.query_to_process = None
 if 'components_loaded' not in st.session_state: st.session_state.components_loaded = False
-
 
 try:
     agent_components = get_agent_components()
@@ -317,10 +294,7 @@ except Exception as e:
     st.stop()
 
 # --- UI Rendering ---
-# Sidebar
 st.sidebar.markdown("## Memory Debugger")
-st.sidebar.markdown("---")
-# The debugging info will be populated here by the summarize_history_if_needed function
 st.sidebar.markdown("---")
 st.sidebar.markdown("## Quick Questions")
 preview_questions = [
@@ -336,7 +310,6 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
     memory = agent_components.get("memory_instance")
     if memory:
-        # Clear the LangGraph checkpoint state for this thread
         memory.put({"configurable": {"thread_id": THREAD_ID}}, {"messages": []})
     
     st.session_state.messages = []
@@ -345,8 +318,6 @@ if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
     print("@@@ Chat history cleared from UI and memory checkpoint.")
     st.rerun()
 
-# Main chat area
-# This is the line that caused the error. Using .get() as a defensive measure.
 for message in st.session_state.get("messages", []):
     with st.chat_message(message["role"]):
         st.markdown(str(message.get("content", "")))
