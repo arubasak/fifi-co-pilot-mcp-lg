@@ -8,14 +8,13 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage, BaseMessage
 
 # --- Constants for History Summarization ---
-# When the *conversational history* (user/assistant messages only)
-# exceeds this, older parts will be summarized.
-SUMMARIZE_THRESHOLD_TOKENS = 4000
+# Lowered for testing. You can set this back to 4000 for production.
+SUMMARIZE_THRESHOLD_TOKENS = 500
 
 # Number of recent user/assistant messages to keep raw (unsummarized).
-# 12 messages means 6 user and 6 assistant turns (user-assistant pair counts as 2 messages).
 MESSAGES_TO_KEEP_AFTER_SUMMARIZATION = 12
 
 TOKEN_MODEL_ENCODING = "cl100k_base"
@@ -33,139 +32,19 @@ if not all([OPENAI_API_KEY, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREA
 llm = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY, temperature=0.2)
 THREAD_ID = "fifi_streamlit_session"
 
-def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> int:
-    if not messages: return 0
-    try: encoding = tiktoken.get_encoding(model_encoding)
-    except Exception:
-        encoding = tiktoken.get_encoding("cl100k_base")
-    num_tokens = 0
-    for message in messages:
-        # Each message follows <|start|><|im_start|>role\ncontent<|end|><|im_end|>
-        # This roughly accounts for role, start/end tokens
-        num_tokens += 4
-        for key, value in message.items():
-            if value is not None:
-                try: 
-                    # Convert non-string types to string for encoding
-                    num_tokens += len(encoding.encode(str(value)))
-                except TypeError: 
-                    # Fallback for complex types, though string conversion should handle most
-                    pass
-    num_tokens += 2 # Every reply is primed with <|start|>assistant<|message|>
-    return num_tokens
-
-# --- NEW: Function to summarize history if needed ---
-async def summarize_history_if_needed(
-    memory_instance: MemorySaver,
-    thread_config: dict,
-    current_system_prompt_content: str,
-    summarize_threshold_tokens: int,
-    keep_last_n_interactions: int,
-    llm_for_summary: ChatOpenAI # Pass the LLM instance for summarization
-):
-    checkpoint_value = memory_instance.get(thread_config)
-    if not checkpoint_value or "messages" not in checkpoint_value or not isinstance(checkpoint_value.get("messages"), list):
-        return False
-    current_messages_in_history = checkpoint_value["messages"]
-    if not current_messages_in_history: return False
-
-    # Filter out any system messages potentially stored in the checkpoint's message history
-    # The current_system_prompt_content will be explicitly prepended anyway.
-    conversational_messages = [m for m in current_messages_in_history if m.get("role") in ["user", "assistant"]]
-
-    current_token_count_conv_only = count_tokens(conversational_messages)
-
-    if current_token_count_conv_only > summarize_threshold_tokens:
-        print(f"INFO: Conversational history token count ({current_token_count_conv_only}) > threshold ({summarize_threshold_tokens}). Summarizing...")
-
-        # Ensure we have enough messages to keep raw, otherwise don't attempt to summarize beyond them
-        if len(conversational_messages) <= keep_last_n_interactions:
-            print(f"INFO: Not enough conversational messages ({len(conversational_messages)}) to summarize beyond the 'keep_last_n_interactions' ({keep_last_n_interactions}) count. Skipping summarization.")
-            return False
-
-        messages_to_summarize = conversational_messages[:-keep_last_n_interactions]
-        messages_to_keep_raw = conversational_messages[-keep_last_n_interactions:]
-
-        if messages_to_summarize:
-            # Construct summarization prompt
-            summarization_prompt_messages = [
-                {"role": "system", "content": "Please summarize the following conversation history concisely, focusing on key topics, user requests, information provided by the assistant, and any resolutions or open questions. The summary should capture the essence of the discussion for continuity. Maintain a neutral and objective tone, suitable for an AI assistant's internal memory."},
-                {"role": "user", "content": "\n".join([f"{m.get('role', '').capitalize()}: {m.get('content', '')}" for m in messages_to_summarize])}
-            ]
-
-            try:
-                # Call LLM to summarize
-                summary_response = await llm_for_summary.ainvoke(summarization_prompt_messages)
-                summary_content = summary_response.content
-                print(f"DEBUG: Generated Summary: {summary_content[:150]}...") # Print first 150 chars of summary
-            except Exception as e:
-                print(f"ERROR: Failed to generate summary: {e}")
-                # Fallback: If summarization fails, create a simple message or handle as appropriate.
-                # For robustness, you might consider trimming here as a last resort.
-                summary_content = "Previous conversation context lost due to summarization error."
-                
-            # Reconstruct the new history for the checkpoint
-            new_history_messages = [{"role": "system", "content": current_system_prompt_content}]
-            new_history_messages.append({"role": "system", "content": f"Previous conversation summary: {summary_content}"})
-            new_history_messages.extend(messages_to_keep_raw)
-            
-            memory_instance.put(thread_config, {"messages": new_history_messages})
-            print(f"INFO: History summarized. New token count: {count_tokens(new_history_messages)}.")
-            return True
-    return False
-
-# ### <<< KEY CHANGE HERE: The robust, synchronous initialization pattern >>> ###
-
-# This is the async part that does the actual work. It is NOT decorated.
-async def run_async_initialization():
-    print("@@@ ASYNC run_async_initialization: Starting actual resource initialization...")
-    client = MultiServerMCPClient({
-        "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
-        "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
-    })
-    tools = await client.get_tools()
-    memory = MemorySaver()
-    agent_executor = create_react_agent(llm, tools, checkpointer=memory)
-    
-    # Identify tools synchronously after they're fetched
-    pinecone_tool_name = "functions.get_context" # Default, will be updated if found
-    woocommerce_tool_names = []
-    all_tool_details = {}
-    for tool in tools:
-        all_tool_details[tool.name] = tool.description
-        if tool.name == "functions.get_context":
-            pinecone_tool_name = tool.name
-        elif "woocommerce" in tool.name.lower():
-            woocommerce_tool_names.append(tool.name)
-
-    print("@@@ ASYNC run_async_initialization: Initialization complete.")
-    return {
-        "agent_executor": agent_executor,
-        "memory_instance": memory,
-        "pinecone_tool_name": pinecone_tool_name,
-        "woocommerce_tool_names": woocommerce_tool_names,
-        "all_tool_details_for_prompt": all_tool_details,
-        "llm_for_summary": llm # <--- Pass the LLM for summarization here
-    }
-
-# This is the SYNCHRONOUS function that Streamlit will cache.
-# It internally calls asyncio.run() only ONCE when the cache is being created.
-@st.cache_resource(ttl=3600)
-def get_agent_components():
-    print("@@@ get_agent_components: Populating cache by running the async initialization...")
-    # This is the correct, safe, and robust way to bridge sync and async for one-time setup.
-    components = asyncio.run(run_async_initialization())
-    return components
-
-# --- Initialize session state (basic flags) ---
-if "messages" not in st.session_state: st.session_state.messages = []
-if 'thinking_for_ui' not in st.session_state: st.session_state.thinking_for_ui = False
-if 'query_to_process' not in st.session_state: st.session_state.query_to_process = None
-
 # --- System Prompt Definition ---
-def get_system_prompt(agent_components):
-    pinecone_tool = agent_components['pinecone_tool_name']
-    all_tool_details = agent_components['all_tool_details_for_prompt']
+# This is defined outside run_async_initialization to be accessible for filtering
+# and also passed directly to messages_modifier.
+def get_system_prompt_content_string(agent_components_for_prompt=None):
+    # Default values for agent_components_for_prompt if not provided (e.g., initial call)
+    if agent_components_for_prompt is None:
+        agent_components_for_prompt = {
+            'pinecone_tool_name': "functions.get_context",
+            'all_tool_details_for_prompt': {"functions.get_context": "Retrieves relevant document snippets from the assistant knowledge base."}
+        }
+
+    pinecone_tool = agent_components_for_prompt['pinecone_tool_name']
+    all_tool_details = agent_components_for_prompt['all_tool_details_for_prompt']
     prompt = f"""You are FiFi, an expert AI assistant for 1-2-Taste. Your **sole purpose** is to assist users with inquiries related to 1-2-Taste's products, the food and beverage ingredients industry, food science topics relevant to 1-2-Taste's offerings, B2B inquiries, recipe development support using 1-2-Taste ingredients, and specific e-commerce functions related to 1-2-Taste's WooCommerce platform.
 
 **Core Mission:**
@@ -214,37 +93,193 @@ def get_system_prompt(agent_components):
 *   If a product is marked as (QUOTE ONLY) and price is missing, ask them to visit: https://www.12taste.com/request-quote/.
 *   Keep answers concise and to the point.
 
-Answer the user's last query based on these instructions and the conversation history.
-"""
+Answer the user's last query based on these instructions and the conversation history."""
     return prompt
 
-# --- Async handler for user queries, using agent with memory ---
+def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> int:
+    if not messages: return 0
+    try: encoding = tiktoken.get_encoding(model_encoding)
+    except Exception:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    num_tokens = 0
+    for message in messages:
+        num_tokens += 4 # For role, start/end tokens
+        if isinstance(message, BaseMessage):
+            content = message.content
+        elif isinstance(message, dict):
+            content = message.get("content", "")
+        else:
+            content = str(message)
+
+        if content is not None:
+            try: num_tokens += len(encoding.encode(str(content)))
+            except (TypeError, AttributeError): pass
+    num_tokens += 2
+    return num_tokens
+
+# --- REVISED Function to summarize history if needed ---
+async def summarize_history_if_needed(
+    memory_instance: MemorySaver,
+    thread_config: dict,
+    main_system_prompt_content_str: str, # Pass the exact system prompt string for filtering
+    summarize_threshold_tokens: int,
+    keep_last_n_interactions: int,
+    llm_for_summary: ChatOpenAI
+):
+    checkpoint = memory_instance.get(thread_config)
+    if not checkpoint or "messages" not in checkpoint:
+        return False
+
+    current_stored_messages = checkpoint["messages"]
+    
+    # 1. Filter out all occurrences of the MAIN system prompt from the stored history.
+    #    These are the redundant ones from previous turns that the checkpointer captured.
+    cleaned_messages = []
+    for m in current_stored_messages:
+        if isinstance(m, SystemMessage) and m.content == main_system_prompt_content_str:
+            # Skip the main system prompt if it was accidentally saved
+            continue
+        cleaned_messages.append(m)
+    
+    # 2. These cleaned messages now represent the true conversational history,
+    #    including any previous summary messages (which are also SystemMessage type
+    #    but start with "Previous conversation summary:").
+    conversational_messages_only = cleaned_messages
+
+    current_token_count = count_tokens(conversational_messages_only)
+
+    # --- Debugging output for Streamlit sidebar ---
+    st.sidebar.markdown(f"**Conv. Tokens (w/ summaries):** `{current_token_count}` / `{summarize_threshold_tokens}`")
+    st.sidebar.markdown(f"**Total Stored Messages (raw):** `{len(current_stored_messages)}`")
+    st.sidebar.markdown(f"**Cleaned Conv. Messages:** `{len(conversational_messages_only)}`")
+
+    if current_token_count > summarize_threshold_tokens:
+        st.info(f"Summarization Triggered: Conversational history ({current_token_count} tokens) > threshold ({summarize_threshold_tokens}).")
+        print(f"INFO: Summarization Triggered. History ({current_token_count}) > threshold ({summarize_threshold_tokens}).")
+
+        # Ensure we have enough messages to summarize beyond the 'keep raw' count
+        if len(conversational_messages_only) <= keep_last_n_interactions:
+            print("INFO: Not enough messages to summarize beyond the 'keep raw' count. Skipping summarization.")
+            st.info(f"Skipping summarization: Not enough conversational messages ({len(conversational_messages_only)}) to summarize beyond the 'keep_last_n_interactions' ({keep_last_n_interactions}) count.")
+            return False
+
+        messages_to_summarize = conversational_messages_only[:-keep_last_n_interactions]
+        messages_to_keep_raw = conversational_messages_only[-keep_last_n_interactions:]
+        
+        st.sidebar.markdown(f"**Messages to Summarize:** `{len(messages_to_summarize)}`")
+        st.sidebar.markdown(f"**Messages to Keep Raw:** `{len(messages_to_keep_raw)}`")
+
+        if messages_to_summarize:
+            # Construct summarization prompt
+            summarization_prompt_messages = [
+                SystemMessage(content="Please summarize the following conversation history concisely. Focus on key topics, user questions, assistant responses, and any resolutions or open questions. The summary should capture the essence of the discussion for continuity. Maintain a neutral and objective tone, suitable for an AI assistant's internal memory. Do not add salutations or conversational filler."),
+                HumanMessage(content="\n".join([f"{m.type.capitalize()}: {m.content}" for m in messages_to_summarize]))
+            ]
+            
+            try:
+                summary_response = await llm_for_summary.ainvoke(summarization_prompt_messages)
+                summary_content = summary_response.content
+                st.info("Summary generated successfully and history updated.")
+                print(f"DEBUG: Generated Summary: {summary_content[:150]}...")
+                
+                # The new history to be stored in the checkpointer is ONLY the summary + recent raw messages
+                # Crucially, the main system prompt is NOT included here.
+                new_messages_for_checkpoint = [SystemMessage(content=f"Previous conversation summary: {summary_content}")] + messages_to_keep_raw
+                
+                # Update the checkpoint with the new summarized history
+                checkpoint["messages"] = new_messages_for_checkpoint
+                memory_instance.put(thread_config, checkpoint)
+                print(f"INFO: Memory checkpoint updated with summarized history. New stored tokens (excluding main system prompt): {count_tokens(new_messages_for_checkpoint)}")
+                return True
+
+            except Exception as e:
+                st.error(f"Failed to generate summary: {e}. Conversation context may be incomplete.")
+                print(f"ERROR: Failed to generate summary: {e}")
+                import traceback
+                print(f"Traceback: {traceback.format_exc()}")
+                return False
+    return False
+
+# --- Async handler for agent initialization ---
+async def run_async_initialization():
+    print("@@@ ASYNC run_async_initialization: Starting actual resource initialization...")
+    client = MultiServerMCPClient({
+        "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
+        "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
+    })
+    tools = await client.get_tools()
+    memory = MemorySaver()
+    
+    pinecone_tool_name = "functions.get_context"
+    all_tool_details = {tool.name: tool.description for tool in tools}
+
+    # Get system prompt content string once during initialization
+    # This ensures consistency for filtering and messages_modifier
+    system_prompt_content_value = get_system_prompt_content_string({
+        'pinecone_tool_name': pinecone_tool_name,
+        'all_tool_details_for_prompt': all_tool_details
+    })
+
+    # This modifier function adds the system prompt to the start of the message list
+    # for each LLM call. It's crucial that the checkpointer does NOT save this.
+    def messages_modifier(messages):
+        # Ensure incoming messages are BaseMessage objects
+        processed_messages = []
+        for msg in messages:
+            if isinstance(msg, tuple) and len(msg) == 2:
+                if msg[0] == "user": processed_messages.append(HumanMessage(content=msg[1]))
+                elif msg[0] == "assistant": processed_messages.append(AIMessage(content=msg[1]))
+                elif msg[0] == "tool": processed_messages.append(ToolMessage(content=msg[1]))
+                elif msg[0] == "system": processed_messages.append(SystemMessage(content=msg[1]))
+            else: # Assume it's already a BaseMessage
+                processed_messages.append(msg)
+        
+        return [SystemMessage(content=system_prompt_content_value)] + processed_messages
+
+    agent_executor = create_react_agent(llm, tools, checkpointer=memory, messages_modifier=messages_modifier)
+    print("@@@ ASYNC run_async_initialization: Initialization complete.")
+    
+    return {
+        "agent_executor": agent_executor,
+        "memory_instance": memory,
+        "llm_for_summary": llm,
+        "main_system_prompt_content_str": system_prompt_content_value # Pass the exact string for filtering
+    }
+
+# --- Synchronous, cached function for Streamlit ---
+@st.cache_resource(ttl=3600)
+def get_agent_components():
+    print("@@@ get_agent_components: Populating cache by running the async initialization...")
+    return asyncio.run(run_async_initialization())
+
+# --- Async handler for user queries ---
 async def execute_agent_call_with_memory(user_query: str, agent_components: dict):
     assistant_reply = ""
     try:
-        agent_executor = agent_components["agent_executor"]
-        memory_instance = agent_components["memory_instance"]
-        llm_for_summary = agent_components["llm_for_summary"] # Get LLM for summarization
-
         config = {"configurable": {"thread_id": THREAD_ID}}
-        system_prompt_content = get_system_prompt(agent_components)
 
-        # --- REPLACED: prune_history_if_needed with summarize_history_if_needed ---
+        # 1. Summarize history if needed. This step now CLEANS the stored history
+        #    of duplicate system prompts before saving it back.
         await summarize_history_if_needed(
-            memory_instance, config, system_prompt_content,
+            agent_components["memory_instance"], config,
+            agent_components["main_system_prompt_content_str"], # Pass the exact system prompt
             SUMMARIZE_THRESHOLD_TOKENS, MESSAGES_TO_KEEP_AFTER_SUMMARIZATION,
-            llm_for_summary # Pass the LLM
+            agent_components["llm_for_summary"]
         )
 
-        current_turn_messages = [
-            {"role": "system", "content": system_prompt_content},
-            {"role": "user", "content": user_query}
-        ]
-        event = {"messages": current_turn_messages}
-        result = await agent_executor.ainvoke(event, config=config)
-
+        # 2. Invoke the agent with ONLY the new user message.
+        #    The checkpointer loads the *cleaned and potentially summarized* history.
+        #    The messages_modifier then ADDS ONE system prompt for *this* specific LLM call.
+        event = {"messages": [HumanMessage(content=user_query)]}
+        result = await agent_components["agent_executor"].ainvoke(event, config=config)
+        
         if isinstance(result, dict) and "messages" in result and result["messages"]:
-            assistant_reply = result["messages"][-1].content
+            for msg in reversed(result["messages"]):
+                if isinstance(msg, AIMessage):
+                    assistant_reply = msg.content
+                    break
+            if not assistant_reply:
+                assistant_reply = f"(Error: No AI message found in result: {result})"
         else:
             assistant_reply = f"(Error: Unexpected agent response format: {type(result)} - {result})"
             st.error(f"Unexpected agent response: {result}")
@@ -267,21 +302,22 @@ def handle_new_query_submission(query_text: str):
         st.rerun()
 
 # --- Streamlit App Starts Here ---
-st.title("FiFi Co-Pilot 🚀 (LangGraph MCP Agent with Auto-Summarizing Memory)")
+st.title("FiFi Co-Pilot 🚀 (Auto-Summarizing Memory)")
 
-# --- Call the synchronous loader function at the start of the script ---
 try:
     agent_components = get_agent_components()
     st.session_state.components_loaded = True
 except Exception as e:
-    st.error(f"Failed to initialize agent components. The app cannot continue. Please refresh. Error: {e}")
-    print(f"@@@ CRITICAL FAILURE during get_agent_components(): {e}")
+    st.error(f"Failed to initialize agent. Please refresh. Error: {e}")
     st.session_state.components_loaded = False
-    st.stop() # Stop the app if initialization fails
-
+    st.stop()
 
 # --- UI Rendering ---
 # Sidebar
+st.sidebar.markdown("## Memory Debugger")
+st.sidebar.markdown("---")
+# The debugging info will be populated here by the summarize_history_if_needed function
+st.sidebar.markdown("---")
 st.sidebar.markdown("## Quick Questions")
 preview_questions = [
     "Help me with my recipe for a new juice drink",
@@ -294,34 +330,15 @@ for question in preview_questions:
 
 st.sidebar.markdown("---")
 if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
+    memory = agent_components.get("memory_instance")
+    if memory:
+        memory.put({"configurable": {"thread_id": THREAD_ID}}, {"messages": []})
+    
     st.session_state.messages = []
     st.session_state.thinking_for_ui = False
     st.session_state.query_to_process = None
-    
-    # Clear the specific cache for this function
-    get_agent_components.clear() 
-    # Remove the loaded flag to force re-initialization on next run
-    if "components_loaded" in st.session_state:
-        del st.session_state["components_loaded"]
-    
-    print("@@@ Chat history cleared, cache cleared.")
+    print("@@@ Chat history cleared from UI and memory checkpoint.")
     st.rerun()
-
-if st.session_state.messages:
-    chat_export_data_txt = "\n\n".join(
-        [f"{str(msg.get('role', 'Unknown')).capitalize()}: {str(msg.get('content', ''))}" for msg in
-         st.session_state.messages]
-    )
-    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.sidebar.download_button(
-        label="📥 Download Chat (TXT)",
-        data=chat_export_data_txt,
-        file_name=f"fifi_mcp_chat_{current_time}.txt",
-        mime="text/plain",
-        use_container_width=True
-    )
-st.sidebar.markdown("---")
-st.sidebar.info("💡 FiFi uses guided memory with auto-pruning and tool prioritization!")
 
 # Main chat area
 for message in st.session_state.messages:
@@ -332,21 +349,13 @@ if st.session_state.get('thinking_for_ui', False):
     with st.chat_message("assistant"):
         st.markdown("⌛ FiFi is thinking...")
 
-if st.session_state.get('thinking_for_ui', False) and st.session_state.get('query_to_process') is not None:
-    if st.session_state.get("components_loaded"):
-        query_to_run = st.session_state.query_to_process
-        st.session_state.query_to_process = None
-        # This is now the ONLY place asyncio.run is called for per-query interaction
-        asyncio.run(execute_agent_call_with_memory(query_to_run, agent_components))
-    else:
-        st.error("Agent is not ready. Please refresh the page.")
-        st.session_state.thinking_for_ui = False
-        st.session_state.query_to_process = None
-        st.rerun()
+if st.session_state.get('query_to_process'):
+    query_to_run = st.session_state.query_to_process
+    st.session_state.query_to_process = None
+    asyncio.run(execute_agent_call_with_memory(query_to_run, agent_components))
 
 user_prompt = st.chat_input("Ask FiFi Co-Pilot...", key="main_chat_input",
                             disabled=st.session_state.get('thinking_for_ui', False) or \
-                                     not st.session_state.get("components_loaded", False)
-                           )
+                                     not st.session_state.get("components_loaded", False))
 if user_prompt:
     handle_new_query_submission(user_prompt)
