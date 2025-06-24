@@ -34,7 +34,7 @@ THREAD_ID = "fifi_streamlit_session"
 
 # --- System Prompt Definition ---
 # This is defined outside run_async_initialization to be accessible for filtering
-# and also passed directly to messages_modifier.
+# and also passed directly when constructing the full message list for invocation.
 def get_system_prompt_content_string(agent_components_for_prompt=None):
     # Default values for agent_components_for_prompt if not provided (e.g., initial call)
     if agent_components_for_prompt is None:
@@ -103,18 +103,18 @@ def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> 
         encoding = tiktoken.get_encoding("cl100k_base")
     num_tokens = 0
     for message in messages:
-        num_tokens += 4 # For role, start/end tokens
+        num_tokens += 4 # For role, start/end tokens (approximate)
         if isinstance(message, BaseMessage):
             content = message.content
         elif isinstance(message, dict):
             content = message.get("content", "")
         else:
-            content = str(message)
+            content = str(message) # Fallback for unexpected types
 
         if content is not None:
             try: num_tokens += len(encoding.encode(str(content)))
             except (TypeError, AttributeError): pass
-    num_tokens += 2
+    num_tokens += 2 # Every reply is primed with <|start|>assistant<|message|>
     return num_tokens
 
 # --- REVISED Function to summarize history if needed ---
@@ -127,23 +127,18 @@ async def summarize_history_if_needed(
     llm_for_summary: ChatOpenAI
 ):
     checkpoint = memory_instance.get(thread_config)
-    if not checkpoint or "messages" not in checkpoint:
-        return False
-
-    current_stored_messages = checkpoint["messages"]
+    current_stored_messages = checkpoint.get("messages", []) if checkpoint else []
     
     # 1. Filter out all occurrences of the MAIN system prompt from the stored history.
-    #    These are the redundant ones from previous turns that the checkpointer captured.
+    #    These are the redundant ones from previous turns that the checkpointer might have captured.
     cleaned_messages = []
     for m in current_stored_messages:
+        # Check if it's a SystemMessage and its content matches our main system prompt string
         if isinstance(m, SystemMessage) and m.content == main_system_prompt_content_str:
-            # Skip the main system prompt if it was accidentally saved
-            continue
+            continue # Skip this message
         cleaned_messages.append(m)
     
-    # 2. These cleaned messages now represent the true conversational history,
-    #    including any previous summary messages (which are also SystemMessage type
-    #    but start with "Previous conversation summary:").
+    # The 'cleaned_messages' now contain only conversational turns and explicit summary messages.
     conversational_messages_only = cleaned_messages
 
     current_token_count = count_tokens(conversational_messages_only)
@@ -187,6 +182,9 @@ async def summarize_history_if_needed(
                 new_messages_for_checkpoint = [SystemMessage(content=f"Previous conversation summary: {summary_content}")] + messages_to_keep_raw
                 
                 # Update the checkpoint with the new summarized history
+                # If checkpoint was empty, create it.
+                if checkpoint is None:
+                    checkpoint = {"messages": []} # Initialize if it was None
                 checkpoint["messages"] = new_messages_for_checkpoint
                 memory_instance.put(thread_config, checkpoint)
                 print(f"INFO: Memory checkpoint updated with summarized history. New stored tokens (excluding main system prompt): {count_tokens(new_messages_for_checkpoint)}")
@@ -214,29 +212,13 @@ async def run_async_initialization():
     all_tool_details = {tool.name: tool.description for tool in tools}
 
     # Get system prompt content string once during initialization
-    # This ensures consistency for filtering and messages_modifier
     system_prompt_content_value = get_system_prompt_content_string({
         'pinecone_tool_name': pinecone_tool_name,
         'all_tool_details_for_prompt': all_tool_details
     })
 
-    # This modifier function adds the system prompt to the start of the message list
-    # for each LLM call. It's crucial that the checkpointer does NOT save this.
-    def messages_modifier(messages):
-        # Ensure incoming messages are BaseMessage objects
-        processed_messages = []
-        for msg in messages:
-            if isinstance(msg, tuple) and len(msg) == 2:
-                if msg[0] == "user": processed_messages.append(HumanMessage(content=msg[1]))
-                elif msg[0] == "assistant": processed_messages.append(AIMessage(content=msg[1]))
-                elif msg[0] == "tool": processed_messages.append(ToolMessage(content=msg[1]))
-                elif msg[0] == "system": processed_messages.append(SystemMessage(content=msg[1]))
-            else: # Assume it's already a BaseMessage
-                processed_messages.append(msg)
-        
-        return [SystemMessage(content=system_prompt_content_value)] + processed_messages
-
-    agent_executor = create_react_agent(llm, tools, checkpointer=memory, messages_modifier=messages_modifier)
+    # Initialize create_react_agent WITHOUT messages_modifier
+    agent_executor = create_react_agent(llm, tools, checkpointer=memory)
     print("@@@ ASYNC run_async_initialization: Initialization complete.")
     
     return {
@@ -257,29 +239,42 @@ async def execute_agent_call_with_memory(user_query: str, agent_components: dict
     assistant_reply = ""
     try:
         config = {"configurable": {"thread_id": THREAD_ID}}
+        main_system_prompt_content_str = agent_components["main_system_prompt_content_str"]
 
-        # 1. Summarize history if needed. This step now CLEANS the stored history
-        #    of duplicate system prompts before saving it back.
+        # 1. Summarize history if needed, AND clean up any duplicate system prompts
+        #    that might have accidentally been saved in previous turns.
         await summarize_history_if_needed(
             agent_components["memory_instance"], config,
-            agent_components["main_system_prompt_content_str"], # Pass the exact system prompt
+            main_system_prompt_content_str,
             SUMMARIZE_THRESHOLD_TOKENS, MESSAGES_TO_KEEP_AFTER_SUMMARIZATION,
             agent_components["llm_for_summary"]
         )
 
-        # 2. Invoke the agent with ONLY the new user message.
-        #    The checkpointer loads the *cleaned and potentially summarized* history.
-        #    The messages_modifier then ADDS ONE system prompt for *this* specific LLM call.
-        event = {"messages": [HumanMessage(content=user_query)]}
+        # 2. Retrieve the *current, cleaned, and potentially summarized* history from the checkpointer.
+        #    This history will NOT contain the main system prompt due to the filtering above.
+        current_checkpoint = agent_components["memory_instance"].get(config)
+        history_messages = current_checkpoint.get("messages", []) if current_checkpoint else []
+
+        # 3. Construct the full list of messages to send to the LLM for *this specific turn*.
+        #    This includes:
+        #    - ONE copy of the main system prompt (always first, as a SystemMessage).
+        #    - The cleaned and summarized conversational history.
+        #    - The current user query.
+        event_messages = [SystemMessage(content=main_system_prompt_content_str)] + history_messages + [HumanMessage(content=user_query)]
+
+        # 4. Invoke the agent with this complete message list.
+        event = {"messages": event_messages}
         result = await agent_components["agent_executor"].ainvoke(event, config=config)
         
         if isinstance(result, dict) and "messages" in result and result["messages"]:
+            # LangGraph's ainvoke result contains the full message history up to the final AI message
+            # We want the content of the very last AI message.
             for msg in reversed(result["messages"]):
                 if isinstance(msg, AIMessage):
                     assistant_reply = msg.content
                     break
             if not assistant_reply:
-                assistant_reply = f"(Error: No AI message found in result: {result})"
+                assistant_reply = f"(Error: No AI message found in result for user query: '{user_query}')"
         else:
             assistant_reply = f"(Error: Unexpected agent response format: {type(result)} - {result})"
             st.error(f"Unexpected agent response: {result}")
@@ -332,6 +327,7 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
     memory = agent_components.get("memory_instance")
     if memory:
+        # Clear the LangGraph checkpoint state for this thread
         memory.put({"configurable": {"thread_id": THREAD_ID}}, {"messages": []})
     
     st.session_state.messages = []
