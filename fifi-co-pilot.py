@@ -101,7 +101,7 @@ def get_system_prompt_content_string(agent_components_for_prompt=None):
         agent_components_for_prompt = { 'pinecone_tool_name': "functions.get_context" }
     pinecone_tool = agent_components_for_prompt['pinecone_tool_name']
 
-    # This prompt uses a strict, programmatic sequence to enforce the fallback logic.
+    # This prompt includes a new rule to handle repetitive suggestions.
     prompt = f"""<instructions>
 <system_role>
 You are FiFi, a helpful and expert AI assistant for 1-2-Taste. Your primary goal is to be helpful within your designated scope. You must follow the tool protocol exactly as written to gather information.
@@ -133,6 +133,7 @@ Your process for gathering information is a mandatory, sequential procedure. Do 
 <formatting_rules>
 - **Citations are Mandatory:** Always cite the URL from the tool you used.
 - **Product Rules:** Do not mention products without a URL. Do not provide prices.
+- **Handling Repetitive Suggestions:** When a user asks for "more" or "other" suggestions, you MUST review the conversation history. Before presenting new results, you must filter out any products or `sourceURL`s that you have already suggested in previous turns. If the search tool returns only products that have already been mentioned, you MUST inform the user that you have no new suggestions based on the current search criteria. Do not list the same products again.
 </formatting_rules>
 
 <final_instruction>
