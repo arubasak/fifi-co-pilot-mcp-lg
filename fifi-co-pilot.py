@@ -1,22 +1,62 @@
+# --- Page Configuration (MUST BE THE FIRST STREAMLIT COMMAND) ---
 import streamlit as st
+import base64
+from pathlib import Path
 import datetime
 import asyncio
 import tiktoken
 import os
+import traceback
+import uuid
 
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage, BaseMessage
+from langchain_core.tools import tool
+from tavily import TavilyClient
 
-# --- Constants for History Summarization ---
-# Lowered for testing. You can set this back to 4000 for production.
-SUMMARIZE_THRESHOLD_TOKENS = 500
+# Helper function to load and Base64-encode images for stateless deployment
+@st.cache_data
+def get_image_as_base64(file_path):
+    """Loads an image file and returns it as a Base64 encoded string."""
+    try:
+        path = Path(file_path)
+        with path.open("rb") as f:
+            data = f.read()
+        return base64.b64encode(data).decode()
+    except Exception as e:
+        print(f"Error loading image {file_path}: {e}")
+        return None
 
-# Number of recent user/assistant messages to keep raw (unsummarized).
-MESSAGES_TO_KEEP_AFTER_SUMMARIZATION = 12
+# Load images once using the helper function
+FIFI_AVATAR_B64 = get_image_as_base64("assets/fifi-avatar.png")
+USER_AVATAR_B64 = get_image_as_base64("assets/user-avatar.png")
 
+# Use the Base64 string for the page_icon to avoid MediaFileStorageError
+st.set_page_config(
+    page_title="FiFi",
+    page_icon=f"data:image/png;base64,{FIFI_AVATAR_B64}" if FIFI_AVATAR_B64 else "🤖",
+    layout="wide",
+    initial_sidebar_state="auto"
+)
+
+# Robust asyncio helper function that works in any environment
+def get_or_create_eventloop():
+    """Gets the active asyncio event loop or creates a new one."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+# --- FINAL: Robust Memory Management Constants ---
+HISTORY_MESSAGE_THRESHOLD = 6
+HISTORY_TOKEN_THRESHOLD = 25000
+MESSAGES_TO_RETAIN_AFTER_SUMMARY = 2
+MAX_INPUT_TOKENS = 25904
 TOKEN_MODEL_ENCODING = "cl100k_base"
 
 # --- Load environment variables from secrets ---
@@ -24,266 +64,256 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 MCP_PINECONE_URL = os.environ.get("MCP_PINECONE_URL")
 MCP_PINECONE_API_KEY = os.environ.get("MCP_PINECONE_API_KEY")
 MCP_PIPEDREAM_URL = os.environ.get("MCP_PIPEDREAM_URL")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 
-if not all([OPENAI_API_KEY, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREAM_URL]):
-    st.error("One or more secrets are missing. Please configure them in Streamlit secrets.")
-    st.stop()
+SECRETS_ARE_MISSING = not all([OPENAI_API_KEY, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREAM_URL, TAVILY_API_KEY])
 
-llm = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY, temperature=0.2)
-THREAD_ID = "fifi_streamlit_session"
+if not SECRETS_ARE_MISSING:
+    llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.2)
+    if 'thread_id' not in st.session_state:
+        st.session_state.thread_id = f"fifi_streamlit_session_{uuid.uuid4()}"
+    THREAD_ID = st.session_state.thread_id
+
+# --- Custom Tavily Fallback & General Search Tool ---
+@tool
+def tavily_search_fallback(query: str) -> str:
+    """
+    Search the web using Tavily. Use this for queries about broader, public-knowledge topics.
+    """
+    try:
+        tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+        response = tavily_client.search(
+            query=query, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False
+        )
+        if response.get('answer'):
+            result = f"Web Search Results:\n\nSummary: {response['answer']}\n\nSources:\n"
+        else:
+            result = "Web Search Results:\n\nSources:\n"
+        for i, source in enumerate(response.get('results', []), 1):
+            result += f"{i}. {source['title']}\n   URL: {source['url']}\n   Content: {source['content'][:300]}...\n\n"
+        return result
+    except Exception as e:
+        return f"Error performing web search: {str(e)}"
 
 # --- System Prompt Definition ---
-# This is defined outside run_async_initialization to be accessible for filtering
-# and also passed directly when constructing the full message list for invocation.
 def get_system_prompt_content_string(agent_components_for_prompt=None):
-    # Default values for agent_components_for_prompt if not provided (e.g., initial call)
     if agent_components_for_prompt is None:
-        agent_components_for_prompt = {
-            'pinecone_tool_name': "functions.get_context",
-            'all_tool_details_for_prompt': {"functions.get_context": "Retrieves relevant document snippets from the assistant knowledge base."}
-        }
-
+        agent_components_for_prompt = { 'pinecone_tool_name': "functions.get_context" }
     pinecone_tool = agent_components_for_prompt['pinecone_tool_name']
-    all_tool_details = agent_components_for_prompt['all_tool_details_for_prompt']
-    prompt = f"""You are FiFi, an expert AI assistant for 1-2-Taste. Your **sole purpose** is to assist users with inquiries related to 1-2-Taste's products, the food and beverage ingredients industry, food science topics relevant to 1-2-Taste's offerings, B2B inquiries, recipe development support using 1-2-Taste ingredients, and specific e-commerce functions related to 1-2-Taste's WooCommerce platform.
-
-**Core Mission:**
-*   Provide accurate, **cited** information about 1-2-Taste's offerings using your product information capabilities.
-*   Assist with relevant e-commerce tasks if explicitly requested by the user in a way that matches your e-commerce functions.
-*   Politely decline to answer questions that are outside of your designated scope.
-
-**Tool Usage Priority and Guidelines (Internal Instructions for You, the LLM):**
-
-1.  **Primary Product & Industry Information Tool (Internally known as `{pinecone_tool}`):**
-    *   For ANY query that could relate to 1-2-Taste product details, ingredients, flavors, availability, specifications, recipes, applications, food industry trends relevant to 1-2-Taste, or any information found within the 1-2-Taste catalog or relevant to its business, you **MUST ALWAYS PRIORITIZE** using this specialized tool (internally, its name is `{pinecone_tool}`). Its description is: "{all_tool_details.get(pinecone_tool, 'Retrieves relevant document snippets from the assistant knowledge base.')}" This is your main and most reliable knowledge source for product-related questions.
-    *   If a query is ambiguous but might be product-related (e.g., "tell me about vanilla"), assume it is about 1-2-Taste's context and use this tool first.
-    *   To manage token usage and control the amount of context returned, you MUST include the `top_k` and `snippet_size` parameters in your arguments. Use the following values:
-        *   `top_k`: 10
-        *   `snippet_size`: 2048
-    *   For example, a correct tool call would look like: `get_context(query='some query about ingredients', top_k=10, snippet_size=2048)`
-
-2.  **E-commerce and Order Management Tools (Internally, these are your WooCommerce tools like `functions.WOOCOMMERCE-GET-ORDER`, etc.):**
-    *   You should **ONLY** use one of these e-commerce tools if the user's query EXPLICITLY mentions "WooCommerce", "orders", "my order", "customer accounts", "shipping status", "store management", "cart issues", or other clearly WooCommerce-specific administrative or e-commerce tasks relevant to 1-2-Taste that map to the specific functions of these tools.
-    *   Do NOT use these e-commerce tools for general product information.
-
-**Describing Your Capabilities to the User:**
-*   **If a user asks what you can do or what tools you have, describe your functions in user-friendly terms. Do NOT reveal the internal or programmatic names of your tools (e.g., do not mention names like 'functions.get_context', 'functions.WOOCOMMERCE-...', or similar).**
-*   Instead, explain your capabilities functionally. For example:
-    *   "I can help you find detailed information about 1-2-Taste's products, ingredients, and flavors."
-    *   "I can assist with inquiries about recipes and product applications using 1-2-Taste ingredients."
-    *   "If you have questions about your orders on the 1-2-Taste platform or need help with e-commerce functions, I can try to assist with that."
-    *   "My main role is to provide information and support related to 1-2-Taste and the food ingredients industry."
-
-**Handling Out-of-Scope Queries:**
-*   If a user's query is clearly unrelated to 1-2-Taste, its products, the food and beverage ingredients industry, relevant food science, B2B interactions in this context, or e-commerce tasks for 1-2-Taste (e.g., asking about celebrity gossip, historical events, general programming help, sports, etc.), you **MUST POLITELY DECLINE** to answer.
-*   Example decline phrases:
-    *   "My apologies, but my expertise is focused on 1-2-Taste and the food ingredients industry. I can't help with that topic."
-    *   "I'm designed to assist with 1-2-Taste's products and related industry topics. Could we focus on that, or is there something else related to food ingredients I can help you with?"
-    *   "That question is outside my scope of knowledge as an assistant for 1-2-Taste."
-
-**General Knowledge (Strictly Limited Use - Internal Instruction for You, the LLM):**
-    *   You should **AVOID** using your general knowledge.
-    *   If, after attempting to use your primary product information tool (internally `{pinecone_tool}`) for a query that *seems potentially relevant* to 1-2-Taste or its industry, the tool yields no useful information or indicates the specific query is out of its own scope (but the topic is still vaguely related to food/ingredients), you *may* provide a very brief, general answer *if you are highly confident*.
-    *   However, if there's any doubt, or if the query leans towards being off-topic even after failing with your product tool, it is better to politely decline as per the "Handling Out-of-Scope Queries" section.
-    *   **Do NOT use general knowledge for topics clearly unrelated to 1-2-Taste's domain.**
-
-**Response Guidelines & Output Format:**
-*   **Strict Inclusion Policy:** You **MUST ONLY** include products in your answer that have a verifiable `productURL` or `source_url` in the tool's output. If a product appears in the tool's context but lacks a URL, you **MUST completely ignore that product** and it must not be mentioned in your response at all.
-*   **Mandatory Citations for Product Information:** For every product you include in your answer (which, per the rule above, will always have a URL), you **MUST ALWAYS** cite the `productURL` or `source_url` provided in the tool's output.
-*   Format citations clearly, for example: "You can find more details here: [Source URL]" or append "[Source: URL]" after the relevant sentence.
-*   If multiple products are mentioned, cite each one appropriately if possible.
-*   If a product is discontinued according to your product information tool, inform the user and, if possible, suggest alternatives found via the same tool (citing them as well).
-*   **Do not provide product prices.** Instead, thank the user for asking and direct them to the product page on the 1-2-Taste website or to contact sales-eu@12taste.com.
-*   If a product is marked as (QUOTE ONLY) and price is missing, ask them to visit: https://www.12taste.com/request-quote/.
-*   Provide comprehensive and detailed answers, explaining your reasoning and including as much relevant information as possible from the context provided by your tools.
-
-Answer the user's last query based on these instructions and the conversation history."""
+    prompt = f"""You are FiFi, the expert AI assistant for 1-2-Taste.
+Your role is strictly limited to inquiries about 1-2-Taste products(ingredients), the food and beverage industry, relevant food science, B2B support, and specific e-commerce tasks. Politely decline all out-of-scope questions.
+**Intelligent Tool Selection Framework:**
+Your first step is to analyze the user's query to determine the best tool. Do not just follow a rigid order; select the tool that best fits the user's intent.
+1.  **When to use `{pinecone_tool}` (Knowledge Base):**
+    *   Use this tool as your **first choice** for queries about 1-2-Taste's internal information.
+    *   **Primary Use Cases:** Specific product details, product(ingredients/flavours) recommendations, applications of specific ingredients, and information found in the internal/technical documents.
+    *   **Required Parameters:** You MUST use `top_k=5` and `snippet_size=1024`.
+2.  **When to use `tavily_search_fallback` (Web Search):**
+    *   Use this tool as your **second choice** for queries about broader, public-knowledge topics if `{pinecone_tool}` tool has not been able to extract relevant results or any information
+    *   **Primary Use Cases:** Recent industry news or market trends, general food science questions.
+3.  **Using Web Search as a Fallback:**
+    *   If you tried the `{pinecone_tool}` for a query that seemed product-specific but it returned no relevant results, you should then use `tavily_search_fallback` (Web Search).
+4.  **E-commerce Tools:**
+    *   Use these for explicit user requests about "WooCommerce", "orders", "customer accounts", or "shipping status".
+**Response Formatting Rules (Strictly Enforced):**
+*   **Citations are MANDATORY:**
+    *   For knowledge base results, cite `productURL`, `source_url`, or `sourceURL`.
+    *   For web results, state the information is from a web search and cite the source URL.
+*   **Product Rules:**
+    *   You MUST NOT mention any product from tool outputs that lacks a verifiable URL.
+    *   You MUST NOT provide product prices. Direct the user to the product page or the correct contact.
+*   **Failure:** If all tools fail, politely state that the information could not be found.
+Based on the conversation history and these instructions, answer the user's last query."""
     return prompt
 
+# --- Helper function to count tokens ---
 def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> int:
     if not messages: return 0
     try: encoding = tiktoken.get_encoding(model_encoding)
-    except Exception:
-        encoding = tiktoken.get_encoding("cl100k_base")
+    except Exception: encoding = tiktoken.get_encoding("cl100k_base")
     num_tokens = 0
     for message in messages:
-        num_tokens += 4 # For role, start/end tokens (approximate)
-        if isinstance(message, BaseMessage):
-            content = message.content
-        elif isinstance(message, dict):
-            content = message.get("content", "")
-        else:
-            content = str(message) # Fallback for unexpected types
-
+        num_tokens += 4
+        if isinstance(message, BaseMessage): content = message.content
+        elif isinstance(message, dict): content = message.get("content", "")
+        else: content = str(message)
         if content is not None:
             try: num_tokens += len(encoding.encode(str(content)))
             except (TypeError, AttributeError): pass
-    num_tokens += 2 # Every reply is primed with <|start|>assistant<|message|>
+    num_tokens += 2
     return num_tokens
 
-# --- REVISED Function to summarize history if needed ---
-async def summarize_history_if_needed(
-    memory_instance: MemorySaver,
-    thread_config: dict,
-    main_system_prompt_content_str: str, # Pass the exact system prompt string for filtering
-    summarize_threshold_tokens: int,
-    keep_last_n_interactions: int,
-    llm_for_summary: ChatOpenAI
-):
-    checkpoint = memory_instance.get(thread_config)
-    current_stored_messages = checkpoint.get("messages", []) if checkpoint else []
-    
-    # 1. Filter out all occurrences of the MAIN system prompt from the stored history.
-    #    This is the crucial step to prevent duplication.
-    cleaned_messages = [
-        m for m in current_stored_messages 
-        if not (isinstance(m, SystemMessage) and m.content == main_system_prompt_content_str)
-    ]
-    
-    # The 'cleaned_messages' now contain only conversational turns and explicit summary messages.
-    conversational_messages_only = cleaned_messages
+# --- Layer 1: History Management Function ---
+async def manage_history_with_summary(memory: MemorySaver, config: dict, llm_for_summary: ChatOpenAI):
+    checkpoint = memory.get(config)
+    if not checkpoint: return
+    history = checkpoint.get("messages", [])
+    conversational_history = [msg for msg in history if isinstance(msg, (AIMessage, HumanMessage))]
+    token_count = count_tokens(conversational_history)
+    message_count = len(conversational_history)
+    if message_count > HISTORY_MESSAGE_THRESHOLD or token_count > HISTORY_TOKEN_THRESHOLD:
+        st.info("Conversation history is long. Summarizing older messages...")
+        print(f"@@@ MEMORY MGMT: Triggered. Msgs: {message_count}, Tokens: {token_count}")
+        if len(conversational_history) <= MESSAGES_TO_RETAIN_AFTER_SUMMARY: return
+        messages_to_summarize = conversational_history[:-MESSAGES_TO_RETAIN_AFTER_SUMMARY]
+        messages_to_keep = conversational_history[-MESSAGES_TO_RETAIN_AFTER_SUMMARY:]
+        summarization_prompt = [SystemMessage(content="You are an expert at creating concise, third-person summaries of conversations. Extract all key entities, topics, and user intentions mentioned."), HumanMessage(content="\n".join([f"{m.type.capitalize()}: {m.content}" for m in messages_to_summarize]))]
+        try:
+            summary_response = await llm_for_summary.ainvoke(summarization_prompt)
+            summary_text = summary_response.content
+            new_history = [SystemMessage(content=f"Summary of preceding conversation: {summary_text}"), *messages_to_keep]
+            checkpoint["messages"] = new_history
+            memory.put(config, checkpoint)
+            print("@@@ MEMORY MGMT: History successfully summarized.")
+        except Exception as e:
+            st.error(f"Could not summarize history: {e}")
 
-    current_token_count = count_tokens(conversational_messages_only)
-
-    st.sidebar.markdown(f"**Conv. Tokens (w/ summaries):** `{current_token_count}` / `{summarize_threshold_tokens}`")
-    st.sidebar.markdown(f"**Total Stored Messages (raw):** `{len(current_stored_messages)}`")
-    st.sidebar.markdown(f"**Cleaned Conv. Messages:** `{len(conversational_messages_only)}`")
-
-    if current_token_count > summarize_threshold_tokens:
-        st.info(f"Summarization Triggered: Conversational history ({current_token_count} tokens) > threshold ({summarize_threshold_tokens}).")
-        print(f"INFO: Summarization Triggered. History ({current_token_count}) > threshold ({summarize_threshold_tokens}).")
-
-        if len(conversational_messages_only) <= keep_last_n_interactions:
-            print("INFO: Not enough messages to summarize beyond the 'keep raw' count. Skipping summarization.")
-            st.info(f"Skipping summarization: Not enough conversational messages ({len(conversational_messages_only)}) to summarize beyond the 'keep_last_n_interactions' ({keep_last_n_interactions}) count.")
-            return False
-
-        messages_to_summarize = conversational_messages_only[:-keep_last_n_interactions]
-        messages_to_keep_raw = conversational_messages_only[-keep_last_n_interactions:]
-        
-        st.sidebar.markdown(f"**Messages to Summarize:** `{len(messages_to_summarize)}`")
-        st.sidebar.markdown(f"**Messages to Keep Raw:** `{len(messages_to_keep_raw)}`")
-
-        if messages_to_summarize:
-            summarization_prompt_messages = [
-                SystemMessage(content="Please summarize the following conversation history concisely..."),
-                HumanMessage(content="\n".join([f"{m.type.capitalize()}: {m.content}" for m in messages_to_summarize]))
-            ]
-            
-            try:
-                summary_response = await llm_for_summary.ainvoke(summarization_prompt_messages)
-                summary_content = summary_response.content
-                st.info("Summary generated successfully and history updated.")
-                print(f"DEBUG: Generated Summary: {summary_content[:150]}...")
-                
-                new_messages_for_checkpoint = [SystemMessage(content=f"Previous conversation summary: {summary_content}")] + messages_to_keep_raw
-                
-                if checkpoint is None:
-                    checkpoint = {"messages": []}
-                checkpoint["messages"] = new_messages_for_checkpoint
-                memory_instance.put(thread_config, checkpoint)
-                print(f"INFO: Memory checkpoint updated with summarized history. New stored tokens: {count_tokens(new_messages_for_checkpoint)}")
-                return True
-
-            except Exception as e:
-                st.error(f"Failed to generate summary: {e}")
-                print(f"ERROR: Failed to generate summary: {e}")
-                import traceback
-                print(f"Traceback: {traceback.format_exc()}")
-                return False
-    return False
+# --- Layer 2: Final Prompt Safety Net ---
+def truncate_prompt_if_needed(messages: list, max_tokens: int) -> list:
+    total_tokens = count_tokens(messages)
+    if total_tokens <= max_tokens:
+        return messages
+    st.warning(f"Request is too large ({total_tokens} tokens). Shortening conversation to fit within limits.")
+    print(f"@@@ SAFETY NET: Payload size {total_tokens} > {max_tokens}. Truncating.")
+    system_message = messages[0]
+    user_query = messages[-1]
+    history = messages[1:-1]
+    while count_tokens([system_message] + history + [user_query]) > max_tokens and history:
+        history.pop(0)
+    return [system_message] + history + [user_query]
 
 # --- Async handler for agent initialization ---
-async def run_async_initialization():
-    print("@@@ ASYNC run_async_initialization: Starting actual resource initialization...")
-    client = MultiServerMCPClient({
-        "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
-        "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
-    })
-    tools = await client.get_tools()
-    memory = MemorySaver()
-    
-    pinecone_tool_name = "functions.get_context"
-    all_tool_details = {tool.name: tool.description for tool in tools}
-
-    system_prompt_content_value = get_system_prompt_content_string({
-        'pinecone_tool_name': pinecone_tool_name,
-        'all_tool_details_for_prompt': all_tool_details
-    })
-
-    agent_executor = create_react_agent(llm, tools, checkpointer=memory)
-    print("@@@ ASYNC run_async_initialization: Initialization complete.")
-    
-    return {
-        "agent_executor": agent_executor,
-        "memory_instance": memory,
-        "llm_for_summary": llm,
-        "main_system_prompt_content_str": system_prompt_content_value
-    }
-
-# --- Synchronous, cached function for Streamlit ---
 @st.cache_resource(ttl=3600)
 def get_agent_components():
-    print("@@@ get_agent_components: Populating cache by running the async initialization...")
-    return asyncio.run(run_async_initialization())
+    async def run_async_initialization():
+        print("@@@ ASYNC: Initializing resources...")
+        client = MultiServerMCPClient({
+            "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
+            "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
+        })
+        mcp_tools = await client.get_tools()
+        all_tools = list(mcp_tools) + [tavily_search_fallback]
+        memory = MemorySaver()
+        pinecone_tool_name = "functions.get_context"
+        system_prompt_content_value = get_system_prompt_content_string({'pinecone_tool_name': pinecone_tool_name})
+        agent_executor = create_react_agent(llm, all_tools, checkpointer=memory)
+        print("@@@ ASYNC: Initialization complete.")
+        return {"agent_executor": agent_executor, "memory_instance": memory, "llm_for_summary": llm, "main_system_prompt_content_str": system_prompt_content_value}
+    
+    print("@@@ get_agent_components: Populating cache...")
+    loop = get_or_create_eventloop()
+    return loop.run_until_complete(run_async_initialization())
 
-# --- Async handler for user queries ---
+# --- FIX: MODIFIED ASYNC HANDLER ---
+# This function now ONLY performs computation and RETURNS the result.
+# It does NOT touch st.session_state or call st.rerun().
 async def execute_agent_call_with_memory(user_query: str, agent_components: dict):
-    assistant_reply = ""
+    """
+    Runs the agent and returns the assistant's reply or an error string.
+    """
     try:
         config = {"configurable": {"thread_id": THREAD_ID}}
+        await manage_history_with_summary(agent_components["memory_instance"], config, agent_components["llm_for_summary"])
         main_system_prompt_content_str = agent_components["main_system_prompt_content_str"]
-
-        await summarize_history_if_needed(
-            agent_components["memory_instance"], config,
-            main_system_prompt_content_str,
-            SUMMARIZE_THRESHOLD_TOKENS, MESSAGES_TO_KEEP_AFTER_SUMMARIZATION,
-            agent_components["llm_for_summary"]
-        )
-
         current_checkpoint = agent_components["memory_instance"].get(config)
         history_messages = current_checkpoint.get("messages", []) if current_checkpoint else []
-
         event_messages = [SystemMessage(content=main_system_prompt_content_str)] + history_messages + [HumanMessage(content=user_query)]
-
-        event = {"messages": event_messages}
+        final_messages = truncate_prompt_if_needed(event_messages, MAX_INPUT_TOKENS)
+        event = {"messages": final_messages}
         result = await agent_components["agent_executor"].ainvoke(event, config=config)
         
+        assistant_reply = ""
         if isinstance(result, dict) and "messages" in result and result["messages"]:
             for msg in reversed(result["messages"]):
                 if isinstance(msg, AIMessage):
                     assistant_reply = msg.content
                     break
             if not assistant_reply:
-                assistant_reply = f"(Error: No AI message found in result for user query: '{user_query}')"
+                assistant_reply = f"(Error: No AI message found for query: '{user_query}')"
         else:
-            assistant_reply = f"(Error: Unexpected agent response format: {type(result)} - {result})"
-            st.error(f"Unexpected agent response: {result}")
+            assistant_reply = f"(Error: Unexpected response format: {type(result)})"
+        
+        return assistant_reply
 
     except Exception as e:
-        import traceback
-        st.error(f"Error during agent invocation: {e}\n{traceback.format_exc()}")
-        assistant_reply = f"(Error: {e})"
-
-    st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
-    st.session_state.thinking_for_ui = False
-    st.rerun()
+        print(f"Error during agent invocation: {e}\n{traceback.format_exc()}")
+        # We display the user-facing error in the main thread now
+        return f"(An error occurred during processing. Please try again.)"
 
 # --- Input Handling Function ---
 def handle_new_query_submission(query_text: str):
     if not st.session_state.get('thinking_for_ui', False):
+        st.session_state.active_question = query_text
         st.session_state.messages.append({"role": "user", "content": query_text})
         st.session_state.query_to_process = query_text
         st.session_state.thinking_for_ui = True
         st.rerun()
 
-# --- Streamlit App Starts Here ---
-st.title("FiFi Co-Pilot 🚀 (Auto-Summarizing Memory)")
+# --- Streamlit App UI ---
+# This CSS block now achieves the final layout using pure CSS manipulation.
+st.markdown("""
+<style>
+    /* 1. Styling for the chat input container (Your Original Version) */
+    .st-emotion-cache-1629p8f {
+        border: 1px solid #ffffff;
+        border-radius: 7px;
+        bottom: 5px;
+        position: fixed;
+        width: 100%;
+        max-width: 736px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 101;
+    }
+    .st-emotion-cache-1629p8f:focus-within {
+        border-color: #e6007e;
+    }
 
+    /* 2. Increase the font size for the introductory caption (Your Original Version) */
+    [data-testid="stCaptionContainer"] p {
+        font-size: 1.3em !important;
+    }
+
+    /* 3. Add a SMALLER padding to the bottom of the whole message list */
+    [data-testid="stVerticalBlock"] {
+        padding-bottom: 40px; /* Reduced to minimize gap at the very bottom */
+    }
+
+    /* 4. FIX: Control the vertical gap BETWEEN individual chat messages */
+    [data-testid="stChatMessage"] {
+        margin-top: 0.1rem !important;
+        margin-bottom: 0.1rem !important;
+    }
+
+    /* 5. Rules for iframe stability */
+    .stApp {
+        overflow-y: auto !important;
+    }
+    .st-scroll-to-bottom {
+        display: none !important;
+    }
+    
+    /* 6. FIX: Hides the sidebar's resizer handle that appears on hover */
+    .st-emotion-cache-1fplawd {
+        display: none !important;
+    }
+
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("<h1 style='font-size: 24px;'>FiFi, AI sourcing assistant</h1>", unsafe_allow_html=True)
+st.caption("Hello, I am FiFi, your AI-powered assistant, designed to support you across the sourcing and product development journey. Find the right ingredients, explore recipe ideas, technical data, and more.")
+
+if SECRETS_ARE_MISSING:
+    st.error("Secrets missing. Please configure necessary environment variables.")
+    st.stop()
+
+# Initialize session state variables
 if "messages" not in st.session_state: st.session_state.messages = []
 if 'thinking_for_ui' not in st.session_state: st.session_state.thinking_for_ui = False
 if 'query_to_process' not in st.session_state: st.session_state.query_to_process = None
 if 'components_loaded' not in st.session_state: st.session_state.components_loaded = False
+if 'active_question' not in st.session_state: st.session_state.active_question = None
 
 try:
     agent_components = get_agent_components()
@@ -294,46 +324,60 @@ except Exception as e:
     st.stop()
 
 # --- UI Rendering ---
-st.sidebar.markdown("## Memory Debugger")
-st.sidebar.markdown("---")
-st.sidebar.markdown("## Quick Questions")
+st.sidebar.markdown("## Quick questions")
 preview_questions = [
-    "Help me with my recipe for a new juice drink",
-    "Suggest me some strawberry flavours for beverage",
-    "I need vanilla flavours for ice-cream"
+    "Suggest some natural strawberry flavours for beverage",
+    "Latest trends in plant-based proteins for 2025?",
+    "Suggest me some vanilla flavours for ice-cream"
 ]
 for question in preview_questions:
-    if st.sidebar.button(question, key=f"preview_{question}", use_container_width=True):
+    button_type = "primary" if st.session_state.active_question == question else "secondary"
+    if st.sidebar.button(question, key=f"preview_{question}", use_container_width=True, type=button_type):
         handle_new_query_submission(question)
 
 st.sidebar.markdown("---")
-if st.sidebar.button("🧹 Clear Chat History", use_container_width=True):
-    memory = agent_components.get("memory_instance")
-    if memory:
-        memory.put({"configurable": {"thread_id": THREAD_ID}}, {"messages": []})
-    
+if st.sidebar.button("🧹 Reset chat session", use_container_width=True):
     st.session_state.messages = []
     st.session_state.thinking_for_ui = False
     st.session_state.query_to_process = None
-    print("@@@ Chat history cleared from UI and memory checkpoint.")
+    st.session_state.thread_id = f"fifi_streamlit_session_{uuid.uuid4()}"
+    st.session_state.active_question = None
+    print(f"@@@ New chat session started. Thread ID: {st.session_state.thread_id}")
     st.rerun()
 
-# --- Defensive access to st.session_state.messages ---
+# Display Terms of Service in the sidebar
+st.sidebar.markdown('By using this agent, you agree to our <a href="https://www.12taste.com/terms-conditions/" target="_blank">Terms of Service</a>.', unsafe_allow_html=True)
+
+# Display chat messages with Base64 avatars
+fifi_avatar_icon = f"data:image/png;base64,{FIFI_AVATAR_B64}" if FIFI_AVATAR_B64 else "🤖"
+user_avatar_icon = f"data:image/png;base64,{USER_AVATAR_B64}" if USER_AVATAR_B64 else "🧑‍💻"
 for message in st.session_state.get("messages", []):
-    with st.chat_message(message["role"]):
-        st.markdown(str(message.get("content", "")))
+    avatar_icon = fifi_avatar_icon if message["role"] == "assistant" else user_avatar_icon
+    with st.chat_message(message["role"], avatar=avatar_icon):
+        st.markdown(message.get("content", ""))
 
 if st.session_state.get('thinking_for_ui', False):
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar=fifi_avatar_icon):
         st.markdown("⌛ FiFi is thinking...")
 
+# Chat input
+user_prompt = st.chat_input("Ask me for ingredients, recipes, or product development—in any language.", key="main_chat_input",
+                            disabled=st.session_state.get('thinking_for_ui', False) or not st.session_state.get("components_loaded", False))
+if user_prompt:
+    st.session_state.active_question = None
+    handle_new_query_submission(user_prompt)
+
+# --- FIX: MODIFIED PROCESSING LOGIC ---
+# This is now the ONLY place where the async function is called and state is updated.
 if st.session_state.get('query_to_process'):
     query_to_run = st.session_state.query_to_process
-    st.session_state.query_to_process = None
-    asyncio.run(execute_agent_call_with_memory(query_to_run, agent_components))
+    
+    # Run the async computation and get the reply back
+    loop = get_or_create_eventloop()
+    assistant_reply = loop.run_until_complete(execute_agent_call_with_memory(query_to_run, agent_components))
 
-user_prompt = st.chat_input("Ask FiFi Co-Pilot...", key="main_chat_input",
-                            disabled=st.session_state.get('thinking_for_ui', False) or \
-                                     not st.session_state.get("components_loaded", False))
-if user_prompt:
-    handle_new_query_submission(user_prompt)
+    # Now, safely manage state in the main Streamlit thread
+    st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
+    st.session_state.thinking_for_ui = False
+    st.session_state.query_to_process = None # Clear the flag
+    st.rerun() # Trigger the final rerun to display the assistant's message
