@@ -19,9 +19,11 @@ from langchain_openai import ChatOpenAI
 from langchain import hub
 from langchain.agents import create_tool_calling_agent
 from langgraph.prebuilt import ToolNode
+# --- NEW: Import AgentAction and AgentFinish for type checking ---
+from langchain_core.agents import AgentAction, AgentFinish
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
+from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage, BaseMessage
 from langchain_core.tools import tool
 from tavily import TavilyClient
 
@@ -37,12 +39,14 @@ def get_image_as_base64(file_path):
         print(f"Error loading image {file_path}: {e}")
         return None
 
-# Load images and set page config
+# Load images once using the helper function
 FIFI_AVATAR_B64 = get_image_as_base64("assets/fifi-avatar.png")
 USER_AVATAR_B64 = get_image_as_base64("assets/user-avatar.png")
+
+# Use the Base64 string for the page_icon to avoid MediaFileStorageError
 st.set_page_config(page_title="FiFi", page_icon=f"data:image/png;base64,{FIFI_AVATAR_B64}" if FIFI_AVATAR_B64 else "🤖", layout="wide", initial_sidebar_state="auto")
 
-# Robust asyncio helper function
+# Robust asyncio helper function that works in any environment
 def get_or_create_eventloop():
     """Gets the active asyncio event loop or creates a new one."""
     try: return asyncio.get_running_loop()
@@ -151,29 +155,47 @@ def get_agent_graph():
 
     mcp_tools = get_or_create_eventloop().run_until_complete(run_async_tool_initialization())
     all_tools = list(mcp_tools) + [tavily_search_fallback]
-    tool_node = ToolNode(all_tools)
+    tool_node = ToolNode(all_tools) # This needs all_tools
     
-    # Define Graph Nodes
+    # This is the agent's brain, created once and reused.
+    system_prompt = get_system_prompt_content_string()
+    agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
+    # The agent_runnable is created once for the graph
+    agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
+    
+    # Define Graph Nodes (nested so they can access agent_runnable, llm, all_tools etc.)
     def agent_node(state: AgentState):
         """Runs the agent runnable with the current state."""
-        # This dynamic prompt now includes the summary if it exists
-        system_prompt = get_system_prompt_content_string()
+        chat_history = state["messages"][:-1]
+        input_text = state["messages"][-1].content
+        
         if state.get("summary"):
-            system_prompt += f"\n\nThis is a summary of the preceding conversation:\n{state['summary']}"
+            summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
+            chat_history = [summary_message] + chat_history
         
-        # We now create the agent dynamically with the potentially updated system prompt
-        agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
-        agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
-        
-        # Invoke the agent with all the required keys, fixing previous KeyErrors
-        result = agent_runnable.invoke({
-            "chat_history": state["messages"][:-1],
-            "input": state["messages"][-1].content,
-            "intermediate_steps": [],
-            "tools": all_tools
+        # Invoke the agent with all required keys
+        agent_output = agent_runnable.invoke({
+            "chat_history": chat_history,
+            "input": input_text,
+            "intermediate_steps": [], # Required by the prompt template
+            "tools": all_tools # Required by the prompt template
         })
-        # The return value must be a dictionary with a "messages" key
-        return {"messages": [result]}
+
+        # --- CRITICAL FIX: Convert AgentAction/AgentFinish to BaseMessage ---
+        if isinstance(agent_output, AgentAction):
+            # If the LLM decided to call a tool, represent it as an AIMessage with tool_calls
+            # This is how LangChain agents typically represent tool-calling outputs in messages
+            return {"messages": [AIMessage(
+                content=f"Calling tool: {agent_output.tool} with input: {agent_output.tool_input}",
+                tool_calls=[{"name": agent_output.tool, "args": agent_output.tool_input}]
+            )]}
+        elif isinstance(agent_output, AgentFinish):
+            # If the LLM has a final answer, represent it as a standard AIMessage
+            return {"messages": [AIMessage(content=agent_output.return_values['output'])]}
+        else:
+            # Fallback for unexpected types (should not happen with create_tool_calling_agent)
+            raise ValueError(f"Unexpected agent_runnable output type: {type(agent_output)}")
+
 
     def summarize_node(state: AgentState):
         """Summarizes the history and prunes old messages."""
@@ -204,7 +226,7 @@ def get_agent_graph():
     graph_builder = StateGraph(AgentState)
     graph_builder.add_node("summarize", summarize_node)
     graph_builder.add_node("agent", agent_node)
-    graph_builder.add_node("tools", tool_node)
+    graph_builder.add_node("tools", tool_node) # ToolNode uses the all_tools from its creation scope
     
     graph_builder.add_conditional_edges("__start__", should_summarize, {"summarize": "summarize", "agent": "agent"})
     graph_builder.add_edge("summarize", "agent")
@@ -240,9 +262,21 @@ def handle_new_query_submission(query_text: str):
         st.session_state.thinking_for_ui = True
         st.rerun()
 
-st.markdown("""<style>...</style>""", unsafe_allow_html=True) # Collapsed for clarity
+st.markdown("""
+<style>
+    .st-emotion-cache-1629p8f { border: 1px solid #ffffff; border-radius: 7px; bottom: 5px; position: fixed; width: 100%; max-width: 736px; left: 50%; transform: translateX(-50%); z-index: 101; }
+    .st-emotion-cache-1629p8f:focus-within { border-color: #e6007e; }
+    [data-testid="stCaptionContainer"] p { font-size: 1.3em !important; }
+    [data-testid="stVerticalBlock"] { padding-bottom: 40px; }
+    [data-testid="stChatMessage"] { margin-top: 0.1rem !important; margin-bottom: 0.1rem !important; }
+    .stApp { overflow-y: auto !important; }
+    .st-scroll-to-bottom { display: none !important; }
+    .st-emotion-cache-1fplawd { display: none !important; }
+</style>
+""", unsafe_allow_html=True)
+
 st.markdown("<h1 style='font-size: 24px;'>FiFi, AI sourcing assistant</h1>", unsafe_allow_html=True)
-st.caption("Hello, I am FiFi, your AI-powered assistant...")
+st.caption("Hello, I am FiFi, your AI-powered assistant, designed to support you across the sourcing and product development journey. Find the right ingredients, explore recipe ideas, technical data, and more.")
 
 if SECRETS_ARE_MISSING:
     st.error("Secrets missing. Please configure necessary environment variables, including OPENAI_API_KEY.")
