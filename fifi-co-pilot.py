@@ -16,7 +16,9 @@ from langgraph.graph.message import add_messages, RemoveMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
+from langchain import hub
+from langchain.agents import create_tool_calling_agent
+from langgraph.prebuilt import ToolNode
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
@@ -92,7 +94,47 @@ def tavily_search_fallback(query: str) -> str:
 def get_system_prompt_content_string():
     pinecone_tool = "functions.get_context"
     prompt = f"""<instructions>
-# ... (Your entire detailed prompt is preserved here) ...
+<system_role>
+You are FiFi, a helpful and expert AI assistant for 1-2-Taste. Your primary goal is to be helpful within your designated scope. Your role is to assist with product and service inquiries, flavours, industry trends, food science, and B2B support. Politely decline out-of-scope questions. You must follow the tool protocol exactly as written to gather information.
+</system_role>
+<core_mission_and_scope>
+Your mission is to provide information and support on 1-2-Taste products, the food and beverage industry, food science, and related B2B support. Use the conversation history to understand the user's intent, especially for follow-up questions.
+</core_mission_and_scope>
+<tool_protocol>
+Your process for gathering information is a mandatory, sequential procedure. Do not deviate.
+1.  **Step 1: Primary Tool Execution.**
+    *   For any user query, your first and only initial action is to call the `{pinecone_tool}`.
+    *   **Parameters:** Unless specified by a different rule (like the Anti-Repetition Rule), you MUST use `top_k=5` and `snippet_size=1024`.
+2.  **Step 2: Mandatory Result Analysis.**
+    *   After the primary tool returns a result, you MUST analyze it against the failure conditions below.
+3.  **Step 3: Conditional Fallback Execution.**
+    *   **If** the primary tool fails (because the result is empty, irrelevant, or lacks a `sourceURL`/`productURL`), then your next and only action **MUST** be to call the `tavily_search_fallback` tool with the original user query.
+    *   Do not stop or apologize after a primary tool failure. The fallback call is a required part of the procedure.
+4.  **Step 4: Final Answer Formulation.**
+    *   Formulate your answer based on the data from the one successful tool call (either the primary or the fallback).
+    *   **Disclaimer Rule:** If your answer is based on results from `tavily_search_fallback`, you **MUST** begin your response with this exact disclaimer, enclosed in a markdown quote block:
+        > I could not find specific results within the 1-2-Taste EU product database. The following information is from a general web search and may point to external sites not affiliated with 1-2-Taste.
+    *   If both tools fail, only then should you state that you could not find the information.
+</tool_protocol>
+<formatting_rules>
+- **Citations are Mandatory:** Always cite the URL from the tool you used. When using tavily_search_fallback, you MUST include every source URL provided in the search results.
+- **Source Format:** Present sources as a numbered list with both title and URL for each result.
+- **Complete Attribution - CRITICAL RULE:** You MUST display ALL sources returned by the tool. If the tool provides 5 sources, your response MUST reference all 5 sources. If the tool provides 3 sources, show all 3. NEVER omit any sources from your response. This is a mandatory requirement.
+- **Source Display Requirements:** 
+  * List every single source with its title and URL
+  * Use the exact format: "1. **[Title]**: [URL]"
+  * Do not summarize or condense the source list
+  * Include all sources even if they seem similar or redundant
+- **Product Rules:** Do not mention products without a URL. NEVER provide product prices; direct users to the product page or ask to contact Sales Team at: sales-eu@12taste.com
+- **Anti-Repetition Rule:**
+    *   When a user asks for "more," "other," or "different" suggestions on a topic you have already discussed, you MUST alter your search strategy.
+    *   **Action:** Your next call to `{pinecone_tool}` for this topic MUST use a larger `top_k` parameter, for example, `top_k=10`. This is to ensure you get a wider selection of potential results.
+    *   **Filtering:** Before presenting the new results, you MUST review the conversation history and filter out any products or `sourceURL`s that you have already suggested.
+    *   **Response:** If you have new, unique products after filtering, present them. If the larger search returns only products you have already mentioned, you MUST inform the user that you have no new suggestions on this topic. Do not list the old products again.
+</formatting_rules>
+<final_instruction>
+Adhering to your core mission and the mandatory tool protocol, provide a helpful and context-aware response to the user's query.
+</final_instruction>
 </instructions>"""
     return prompt
 
@@ -109,6 +151,7 @@ def get_agent_graph():
 
     mcp_tools = get_or_create_eventloop().run_until_complete(run_async_tool_initialization())
     all_tools = list(mcp_tools) + [tavily_search_fallback]
+    tool_node = ToolNode(all_tools)
     
     # Define Graph Nodes
     def agent_node(state: AgentState):
@@ -116,10 +159,13 @@ def get_agent_graph():
         system_prompt = get_system_prompt_content_string()
         if state.get("summary"):
             system_prompt += f"\n\nThis is a summary of the preceding conversation:\n{state['summary']}"
-
+        
+        # Use the pre-built agent for the tool-calling loop
         agent_executor = create_react_agent(llm, all_tools, system_message=system_prompt)
         result = agent_executor.invoke({"messages": state["messages"]})
-        return {"messages": result["messages"]}
+        
+        # The result is already in the correct format {"messages": [AIMessage(...)]}
+        return result
 
     def summarize_node(state: AgentState):
         """Summarizes the history and prunes old messages."""
@@ -168,7 +214,7 @@ async def execute_agent_call_with_memory(user_query: str, graph):
         error_message = f"**An error occurred during processing:**\n\n```\n{traceback.format_exc()}\n```"
         return error_message
 
-# --- Input Handling and UI (Unchanged) ---
+# --- Input Handling and UI ---
 def handle_new_query_submission(query_text: str):
     if not st.session_state.get('thinking_for_ui', False):
         st.session_state.active_question = query_text
