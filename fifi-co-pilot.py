@@ -16,7 +16,8 @@ from langgraph.graph.message import add_messages, RemoveMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain_openai import ChatOpenAI
-from langchain import hub
+# --- MODIFIED: Use ChatPromptTemplate directly ---
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.agents import create_tool_calling_agent
 from langgraph.prebuilt import ToolNode
 from langchain_core.agents import AgentAction, AgentFinish 
@@ -60,13 +61,10 @@ class AgentState(TypedDict):
 
 # Load environment variables
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-# --- REMOVED: MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREAM_URL ---
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY") 
 PINECONE_ASSISTANT_NAME = os.environ.get("PINECONE_ASSISTANT_NAME") 
 
-
-# --- MODIFIED: Simplified SECRETS_ARE_MISSING check ---
 SECRETS_ARE_MISSING = not all([OPENAI_API_KEY, TAVILY_API_KEY, PINECONE_API_KEY, PINECONE_ASSISTANT_NAME])
 
 if not SECRETS_ARE_MISSING:
@@ -74,7 +72,7 @@ if not SECRETS_ARE_MISSING:
     if 'thread_id' not in st.session_state: st.session_state.thread_id = f"fifi_streamlit_session_{uuid.uuid4()}"
     THREAD_ID = st.session_state.thread_id
 
-# --- Manually defined get_context tool ---
+# --- Manually defined get_context tool (FIXED to use snippet.reference) ---
 @tool
 def get_context(query: str, top_k: int = 5, snippet_size: int = 1024) -> str:
     """
@@ -89,13 +87,16 @@ def get_context(query: str, top_k: int = 5, snippet_size: int = 1024) -> str:
             return "No relevant context snippets found in the 1-2-Taste database."
         result = "Context Snippets:\n\n"
         for i, snippet in enumerate(response.snippets, 1):
-            source_url = snippet.metadata.get('sourceURL') or snippet.metadata.get('productURL', 'N/A')
-            result += f"{i}. Source: {source_url}\n   Snippet: {snippet.text}\n\n"
+            # --- FIXED: Access reference attribute for source info ---
+            file_name = snippet.reference.get("file", {}).get("name", "N/A")
+            source_url = snippet.reference.get("file", {}).get("signed_url", "N/A") # Or other URL field if available
+            
+            result += f"{i}. Source: {file_name}\n   URL: {source_url}\n   Snippet: {snippet.content}\n\n"
         return result
     except Exception as e:
         return f"Error retrieving context from Pinecone: {str(e)}"
 
-# Tavily Search Tool with Exclusions (Modified for better LLM parsing)
+# --- Tavily Search Tool with Exclusions (MODIFIED for better LLM parsing) ---
 DEFAULT_EXCLUDED_DOMAINS = [
     "ingredientsnetwork.com", "csmingredients.com", "batafood.com", "nccingredients.com", "prinovaglobal.com", "ingrizo.com",
     "solina.com", "opply.com", "brusco.co.uk", "lehmanningredients.co.uk", "i-ingredients.com", "fciltd.com", "lupafoods.com",
@@ -105,27 +106,32 @@ DEFAULT_EXCLUDED_DOMAINS = [
 ]
 @tool
 def tavily_search_fallback(query: str) -> str:
-    """Search the web using Tavily, excluding competitor domains."""
+    """
+    Search the web using Tavily. Used for broader topics.
+    Returns formatted summary and sources (Title + URL) for LLM to cite easily.
+    Omits verbose content to prevent LLM struggling with formatting.
+    """
     try:
         tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         response = tavily_client.search(
-            query=query, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False,
+            query=query, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False, # include_raw_content=False is crucial here
             exclude_domains=DEFAULT_EXCLUDED_DOMAINS
         )
         
-        formatted_results = ""
+        formatted_output = ""
         if response.get('answer'):
-            formatted_results += f"Web Search Summary: {response['answer']}\n\n"
+            formatted_output += f"Web Search Summary: {response['answer']}\n\n"
         
         if response.get('results'):
-            formatted_results += "Sources:\n"
+            formatted_output += "Sources:\n"
             for i, source in enumerate(response['results'], 1):
-                formatted_results += f"1. **{source.get('title', 'No Title')}**: {source.get('url', 'No URL')}\n"
+                # Align with system prompt's desired format: "1. **[Title]**: [URL]"
+                formatted_output += f"{i}. **{source.get('title', 'No Title')}**: {source.get('url', 'No URL')}\n"
         
-        return formatted_results if formatted_results else "No relevant information found via web search."
+        return formatted_output if formatted_output else "No relevant information found via web search."
     except Exception as e: return f"Error performing web search: {str(e)}"
 
-# System Prompt Definition
+# System Prompt Definition (Preserved from your code)
 def get_system_prompt_content_string():
     pinecone_tool = "get_context" # Referencing the new tool name
     prompt = f"""<instructions>
@@ -191,8 +197,18 @@ def get_agent_graph():
     
     # This is the agent's brain, created once and reused.
     system_prompt_content = get_system_prompt_content_string()
-    agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt_content)
-    agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
+    # --- MODIFIED: Custom ChatPromptTemplate for precise control ---
+    agent_prompt_template = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt_content), # Your custom system prompt is ALWAYS first
+            MessagesPlaceholder("chat_history", optional=True), # History comes next
+            ("human", "{input}"), # New user input
+            MessagesPlaceholder("agent_scratchpad", optional=True), # Agent's thoughts and tool outputs
+            MessagesPlaceholder("tools", optional=True) # Tool descriptions (if using custom tool display)
+        ]
+    )
+    # The agent_runnable is created once for the graph
+    agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt_template)
     
     # Define Graph Nodes (nested so they can access agent_runnable, llm, all_tools etc.)
     def agent_node(state: AgentState):
@@ -200,6 +216,7 @@ def get_agent_graph():
         chat_history = state["messages"][:-1]
         input_text = state["messages"][-1].content
         
+        # --- NEW: Explicitly prepend summary as a SystemMessage if it exists ---
         if state.get("summary"):
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
@@ -217,19 +234,25 @@ def get_agent_graph():
 
         # Robustly convert agent_runnable output to List[BaseMessage]
         processed_messages = []
+        # agent_runnable.invoke usually returns a single item directly, not a list.
+        # But if it's a list, process each item.
         output_items = agent_output_raw if isinstance(agent_output_raw, list) else [agent_output_raw]
 
         for item in output_items:
+            # Check for attributes that define AgentAction (more robust than isinstance for version quirks)
             if hasattr(item, 'tool') and hasattr(item, 'tool_input') and hasattr(item, 'log'):
                 processed_messages.append(AIMessage(
-                    content="", 
+                    content="", # Tool-calling AI messages usually have empty content, just tool_calls
                     tool_calls=[{"name": item.tool, "args": item.tool_input, "id": getattr(item, 'tool_call_id', str(uuid.uuid4()))}]
                 ))
+            # Check for attributes that define AgentFinish
             elif hasattr(item, 'return_values') and isinstance(getattr(item, 'return_values', None), dict):
                 processed_messages.append(AIMessage(content=item.return_values.get('output', '')))
+            # If it's already a BaseMessage, simply append it
             elif isinstance(item, BaseMessage):
                 processed_messages.append(item)
             else:
+                # Fallback for truly unexpected types - this should ideally not be hit
                 raise ValueError(f"Agent runnable returned an item of unexpected type: {type(item)}. Content: {item}")
 
         return {"messages": processed_messages}
@@ -238,7 +261,7 @@ def get_agent_graph():
     def summarize_node(state: AgentState):
         """Summarizes the history and prunes old messages."""
         messages_to_summarize = state["messages"][:-1]
-        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False) 
+        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False) # Increased limit for better summaries
         for msg in messages_to_summarize:
             if isinstance(msg, HumanMessage): summarizer_memory.chat_memory.add_user_message(msg.content)
             else: summarizer_memory.chat_memory.add_ai_message(msg.content)
