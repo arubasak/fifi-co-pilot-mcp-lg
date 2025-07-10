@@ -2,17 +2,20 @@
 streamlit==1.46.0
 tavily-python
 langchain-tavily
-fpdf2
-langmem
+# fpdf2  # REMOVED - Not used in the agent code
 
 # Env handling
 python-dotenv==1.1.0
 
 # LangChain ecosystem (ensure compatibility)
+# --- CRITICAL ADDITION ---
+# Needed for ConversationSummaryBufferMemory, hub.pull, and create_tool_calling_agent
+langchain==0.2.25
+
 langchain-core==0.3.66
 langchain-openai==0.3.19
 
-# LangGraph integration
+# LangGraph integration (versions are compatible)
 langgraph==0.4.8
 langgraph-prebuilt==0.2.2
 langgraph-sdk==0.1.70
@@ -36,5 +39,8 @@ pinecone-plugin-assistant==1.6.1
 pinecone-plugin-interface==0.0.7
 requests==2.32.3
 uvicorn==0.34.2
-tiktoken==0.9.0
 nest_asyncio==1.6.0
+
+# --- REMOVED ---
+# langmem # No longer needed, replaced by integrated LangChain memory
+# tiktoken # No longer used by the new memory management logic
