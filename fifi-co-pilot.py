@@ -75,7 +75,6 @@ def get_context(query: str, conversation_history: list = None) -> str:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         assistant = pc.assistant.Assistant(assistant_name=PINECONE_ASSISTANT_NAME)
         messages = []
-        # The agent can pass the history if it deems it necessary
         if conversation_history:
             for msg in conversation_history:
                 messages.append(Message(role=msg["role"], content=msg["content"]))
@@ -122,7 +121,6 @@ class Agent:
         graph = StateGraph(AgentState)
         graph.add_node("llm", self.call_llm)
         graph.add_node("action", ToolNode(tools))
-        # FIX: The router is now a method of this class
         graph.add_node("router", self.router)
 
         graph.set_entry_point("llm")
@@ -132,12 +130,13 @@ class Agent:
         
         self.graph = graph.compile(checkpointer=MemorySaver())
 
-    def should_call_tool(self, state: AgentState):
+    # --- THIS IS THE FIX ---
+    def should_call_tool(self, state: AgentState) -> bool:
         """Determines if the LLM decided to call a tool."""
-        return isinstance(state['messages'][-1], AIMessage) and state['messages'][-1].tool_calls
+        # This now explicitly returns True or False
+        return bool(isinstance(state['messages'][-1], AIMessage) and state['messages'][-1].tool_calls)
 
-    # FIX: This is now a method of the class
-    def router(self, state: AgentState):
+    def router(self, state: AgentState) -> str:
         """After a tool call, this router decides if we need to fall back to Tavily or if we can continue."""
         last_message = state['messages'][-1]
         if not isinstance(last_message, ToolMessage):
@@ -147,7 +146,7 @@ class Agent:
             return "fallback"
         return "continue"
 
-    def should_fallback(self, state: AgentState):
+    def should_fallback(self, state: AgentState) -> str:
         """This is a simple wrapper for the router to be used in conditional edges."""
         return self.router(state)
 
@@ -185,11 +184,7 @@ async def execute_agent_call_with_memory(user_query: str, graph):
     """Runs the agent graph with the user's query and existing session history."""
     try:
         config = {"configurable": {"thread_id": THREAD_ID}}
-        
-        # We start a new graph invocation with just the user's latest message.
-        # The checkpointer in the graph will automatically load the previous messages.
         messages = [HumanMessage(content=user_query)]
-
         final_state = await graph.ainvoke({"messages": messages}, config=config)
         assistant_reply = final_state["messages"][-1].content
         
