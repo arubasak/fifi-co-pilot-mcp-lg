@@ -125,7 +125,7 @@ def tavily_search_fallback(query: str) -> str:
         return formatted_results if formatted_results else "No relevant information found via web search."
     except Exception as e: return f"Error performing web search: {str(e)}"
 
-# System Prompt Definition (Preserved from your code)
+# System Prompt Definition
 def get_system_prompt_content_string():
     pinecone_tool = "get_context" # Referencing the new tool name
     prompt = f"""<instructions>
@@ -318,7 +318,6 @@ st.markdown("<h1 style='font-size: 24px;'>FiFi, AI sourcing assistant</h1>", uns
 st.caption("Hello, I am FiFi, your AI-powered assistant, designed to support you across the sourcing and product development journey. Find the right ingredients, explore recipe ideas, technical data, and more.")
 
 if SECRETS_ARE_MISSING:
-    # --- MODIFIED: Updated secrets missing message ---
     st.error("Secrets missing. Please configure necessary environment variables, including OPENAI_API_KEY, TAVILY_API_KEY, PINECONE_API_KEY, and PINECONE_ASSISTANT_NAME.")
     st.stop()
 
