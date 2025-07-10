@@ -16,8 +16,7 @@ from langgraph.graph.message import add_messages, RemoveMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain_openai import ChatOpenAI
-# --- MODIFIED: Use ChatPromptTemplate directly ---
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain import hub
 from langchain.agents import create_tool_calling_agent
 from langgraph.prebuilt import ToolNode
 from langchain_core.agents import AgentAction, AgentFinish 
@@ -72,7 +71,7 @@ if not SECRETS_ARE_MISSING:
     if 'thread_id' not in st.session_state: st.session_state.thread_id = f"fifi_streamlit_session_{uuid.uuid4()}"
     THREAD_ID = st.session_state.thread_id
 
-# --- Manually defined get_context tool (FIXED to use snippet.reference) ---
+# --- Manually defined get_context tool ---
 @tool
 def get_context(query: str, top_k: int = 5, snippet_size: int = 1024) -> str:
     """
@@ -87,16 +86,15 @@ def get_context(query: str, top_k: int = 5, snippet_size: int = 1024) -> str:
             return "No relevant context snippets found in the 1-2-Taste database."
         result = "Context Snippets:\n\n"
         for i, snippet in enumerate(response.snippets, 1):
-            # --- FIXED: Access reference attribute for source info ---
             file_name = snippet.reference.get("file", {}).get("name", "N/A")
-            source_url = snippet.reference.get("file", {}).get("signed_url", "N/A") # Or other URL field if available
+            source_url = snippet.reference.get("file", {}).get("signed_url", "N/A")
             
             result += f"{i}. Source: {file_name}\n   URL: {source_url}\n   Snippet: {snippet.content}\n\n"
         return result
     except Exception as e:
         return f"Error retrieving context from Pinecone: {str(e)}"
 
-# --- Tavily Search Tool with Exclusions (MODIFIED for better LLM parsing) ---
+# --- Tavily Search Tool with Exclusions (Modified for better LLM parsing) ---
 DEFAULT_EXCLUDED_DOMAINS = [
     "ingredientsnetwork.com", "csmingredients.com", "batafood.com", "nccingredients.com", "prinovaglobal.com", "ingrizo.com",
     "solina.com", "opply.com", "brusco.co.uk", "lehmanningredients.co.uk", "i-ingredients.com", "fciltd.com", "lupafoods.com",
@@ -106,15 +104,11 @@ DEFAULT_EXCLUDED_DOMAINS = [
 ]
 @tool
 def tavily_search_fallback(query: str) -> str:
-    """
-    Search the web using Tavily. Used for broader topics.
-    Returns formatted summary and sources (Title + URL) for LLM to cite easily.
-    Omits verbose content to prevent LLM struggling with formatting.
-    """
+    """Search the web using Tavily, excluding competitor domains."""
     try:
         tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         response = tavily_client.search(
-            query=query, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False, # include_raw_content=False is crucial here
+            query=query, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False,
             exclude_domains=DEFAULT_EXCLUDED_DOMAINS
         )
         
@@ -125,13 +119,12 @@ def tavily_search_fallback(query: str) -> str:
         if response.get('results'):
             formatted_output += "Sources:\n"
             for i, source in enumerate(response['results'], 1):
-                # Align with system prompt's desired format: "1. **[Title]**: [URL]"
-                formatted_output += f"{i}. **{source.get('title', 'No Title')}**: {source.get('url', 'No URL')}\n"
+                formatted_output += f"1. **{source.get('title', 'No Title')}**: {source.get('url', 'No URL')}\n"
         
         return formatted_output if formatted_output else "No relevant information found via web search."
     except Exception as e: return f"Error performing web search: {str(e)}"
 
-# System Prompt Definition (Preserved from your code)
+# System Prompt Definition
 def get_system_prompt_content_string():
     pinecone_tool = "get_context" # Referencing the new tool name
     prompt = f"""<instructions>
@@ -191,23 +184,22 @@ Adhering to your core mission and the mandatory tool protocol, provide a helpful
 @st.cache_resource(ttl=3600)
 def get_agent_graph():
     """Constructs the unified LangGraph agent with integrated memory."""
-    # --- MODIFIED: Directly define all_tools - No MCPClient used anymore ---
     all_tools = [get_context, tavily_search_fallback]
     tool_node = ToolNode(all_tools) 
     
     # This is the agent's brain, created once and reused.
     system_prompt_content = get_system_prompt_content_string()
-    # --- MODIFIED: Custom ChatPromptTemplate for precise control ---
+    # --- MODIFIED: Custom ChatPromptTemplate with correct placeholders ---
     agent_prompt_template = ChatPromptTemplate.from_messages(
         [
             ("system", system_prompt_content), # Your custom system prompt is ALWAYS first
             MessagesPlaceholder("chat_history", optional=True), # History comes next
             ("human", "{input}"), # New user input
             MessagesPlaceholder("agent_scratchpad", optional=True), # Agent's thoughts and tool outputs
-            MessagesPlaceholder("tools", optional=True) # Tool descriptions (if using custom tool display)
+            # --- REMOVED: MessagesPlaceholder("tools", optional=True) ---
+            # tools are passed to create_tool_calling_agent and are handled internally
         ]
     )
-    # The agent_runnable is created once for the graph
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt_template)
     
     # Define Graph Nodes (nested so they can access agent_runnable, llm, all_tools etc.)
@@ -216,7 +208,7 @@ def get_agent_graph():
         chat_history = state["messages"][:-1]
         input_text = state["messages"][-1].content
         
-        # --- NEW: Explicitly prepend summary as a SystemMessage if it exists ---
+        # Explicitly prepend summary as a SystemMessage if it exists
         if state.get("summary"):
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
@@ -226,7 +218,8 @@ def get_agent_graph():
             "chat_history": chat_history,
             "input": input_text,
             "intermediate_steps": [], # Required by the prompt template
-            "tools": all_tools # Required by the prompt template
+            # --- REMOVED: "tools": all_tools from invoke call ---
+            # tools are handled internally by create_tool_calling_agent
         },
         # Pass custom metadata to LLM invocation for logging correlation
         config={"metadata": {"langgraph_thread_id": THREAD_ID}}
@@ -242,7 +235,7 @@ def get_agent_graph():
             # Check for attributes that define AgentAction (more robust than isinstance for version quirks)
             if hasattr(item, 'tool') and hasattr(item, 'tool_input') and hasattr(item, 'log'):
                 processed_messages.append(AIMessage(
-                    content="", # Tool-calling AI messages usually have empty content, just tool_calls
+                    content="", 
                     tool_calls=[{"name": item.tool, "args": item.tool_input, "id": getattr(item, 'tool_call_id', str(uuid.uuid4()))}]
                 ))
             # Check for attributes that define AgentFinish
@@ -261,7 +254,7 @@ def get_agent_graph():
     def summarize_node(state: AgentState):
         """Summarizes the history and prunes old messages."""
         messages_to_summarize = state["messages"][:-1]
-        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False) # Increased limit for better summaries
+        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False) 
         for msg in messages_to_summarize:
             if isinstance(msg, HumanMessage): summarizer_memory.chat_memory.add_user_message(msg.content)
             else: summarizer_memory.chat_memory.add_ai_message(msg.content)
