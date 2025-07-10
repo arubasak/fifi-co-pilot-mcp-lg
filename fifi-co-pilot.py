@@ -20,7 +20,7 @@ from langchain import hub
 from langchain.agents import create_tool_calling_agent
 from langgraph.prebuilt import ToolNode
 # --- NEW: Import AgentAction and AgentFinish for explicit type handling ---
-from langchain_core.agents import AgentAction, AgentFinish
+from langchain_core.agents import AgentAction, AgentFinish # Keep these imports
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage, BaseMessage
@@ -34,7 +34,7 @@ def get_image_as_base64(file_path):
     try:
         path = Path(file_path)
         with path.open("rb") as f: data = f.read()
-        return base664.b64encode(data).decode()
+        return base64.b64encode(data).decode()
     except Exception as e:
         print(f"Error loading image {file_path}: {e}")
         return None
@@ -180,7 +180,7 @@ def get_agent_graph():
             "tools": all_tools # Required by the prompt template
         })
 
-        # --- CRITICAL FIX: Convert AgentAction/AgentFinish to BaseMessage ---
+        # --- CRITICAL FIX: Robustly convert agent_runnable output to List[BaseMessage] ---
         # The output from create_tool_calling_agent.invoke() can be AgentAction, AgentFinish, or sometimes AIMessage.
         # We need to ensure the output to the graph state is always a List[BaseMessage].
         
@@ -189,21 +189,21 @@ def get_agent_graph():
         output_items = agent_output_raw if isinstance(agent_output_raw, list) else [agent_output_raw]
 
         for item in output_items:
-            if isinstance(item, AgentAction):
-                # If the LLM decided to call a tool, represent it as an AIMessage with tool_calls
+            # Check for attributes that define AgentAction (more robust than isinstance for version quirks)
+            if hasattr(item, 'tool') and hasattr(item, 'tool_input') and hasattr(item, 'log'):
                 processed_messages.append(AIMessage(
                     content="", # Tool-calling AI messages often have no content, just tool_calls
-                    tool_calls=[{"name": item.tool, "args": item.tool_input, "id": item.tool_call_id or str(uuid.uuid4())}]
+                    tool_calls=[{"name": item.tool, "args": item.tool_input, "id": getattr(item, 'tool_call_id', str(uuid.uuid4()))}]
                 ))
-            elif isinstance(item, AgentFinish):
-                # If the LLM has a final answer, represent it as a standard AIMessage
+            # Check for attributes that define AgentFinish
+            elif hasattr(item, 'return_values') and isinstance(getattr(item, 'return_values', None), dict):
                 processed_messages.append(AIMessage(content=item.return_values.get('output', '')))
+            # If it's already a BaseMessage, simply append it
             elif isinstance(item, BaseMessage):
-                # If it's already a BaseMessage (e.g., direct AI response without tool calling), keep it
                 processed_messages.append(item)
             else:
-                # Fallback for unexpected types (should ideally not be hit with this agent type)
-                raise ValueError(f"Unexpected item type in agent_runnable output: {type(item)}. Content: {item}")
+                # Fallback for truly unexpected types - this should ideally not be hit
+                raise ValueError(f"Agent runnable returned an item of unexpected type: {type(item)}. Content: {item}")
 
         # The return value must be a dictionary with a "messages" key containing a List[BaseMessage]
         return {"messages": processed_messages}
