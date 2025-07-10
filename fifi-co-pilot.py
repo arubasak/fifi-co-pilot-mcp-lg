@@ -4,20 +4,28 @@ import base64
 from pathlib import Path
 import datetime
 import asyncio
-import tiktoken
 import os
 import traceback
 import uuid
+from typing import Annotated, List, Literal
+from typing_extensions import TypedDict
 
-from langgraph.prebuilt import create_react_agent
+# --- LangGraph and LangChain Imports ---
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages, RemoveMessage
 from langgraph.checkpoint.memory import MemorySaver
+from langchain.memory import ConversationSummaryBufferMemory
 from langchain_openai import ChatOpenAI
+from langchain import hub
+from langchain.agents import create_tool_calling_agent
+from langgraph.prebuilt import ToolNode
+
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage, BaseMessage
 from langchain_core.tools import tool
 from tavily import TavilyClient
 
-# Helper function to load and Base64-encode images for stateless deployment
+# Helper function to load and Base64-encode images
 @st.cache_data
 def get_image_as_base64(file_path):
     """Loads an image file and returns it as a Base64 encoded string."""
@@ -52,12 +60,10 @@ def get_or_create_eventloop():
         asyncio.set_event_loop(loop)
         return loop
 
-# --- FINAL: Robust Memory Management Constants ---
-HISTORY_MESSAGE_THRESHOLD = 6
-HISTORY_TOKEN_THRESHOLD = 25000
-MESSAGES_TO_RETAIN_AFTER_SUMMARY = 2
-MAX_INPUT_TOKENS = 25904
-TOKEN_MODEL_ENCODING = "cl100k_base"
+# --- NEW: Define the state for our LangGraph agent ---
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    summary: str
 
 # --- Load environment variables from secrets ---
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -74,16 +80,27 @@ if not SECRETS_ARE_MISSING:
         st.session_state.thread_id = f"fifi_streamlit_session_{uuid.uuid4()}"
     THREAD_ID = st.session_state.thread_id
 
-# --- Custom Tavily Fallback & General Search Tool ---
+# --- Tavily Search Tool with Exclusions (Preserved from your code) ---
+DEFAULT_EXCLUDED_DOMAINS = [
+    "ingredientsnetwork.com", "csmingredients.com", "batafood.com", "nccingredients.com", "prinovaglobal.com",
+    "ingrizo.com", "solina.com", "opply.com", "brusco.co.uk", "lehmanningredients.co.uk", "i-ingredients.com",
+    "fciltd.com", "lupafoods.com", "tradeingredients.com", "peterwhiting.co.uk", "globalgrains.co.uk",
+    "tradeindia.com", "udaan.com", "ofbusiness.com", "indiamart.com", "symega.com", "meviveinternational.com",
+    "amazon.com", "podfoods.co", "gocheetah.com", "foodmaven.com", "connect.kehe.com", "knowde.com",
+    "ingredientsonline.com", "sourcegoodfood.com"
+]
+
 @tool
 def tavily_search_fallback(query: str) -> str:
     """
     Search the web using Tavily. Use this for queries about broader, public-knowledge topics.
+    This tool automatically excludes a predefined list of competitor and marketplace domains.
     """
     try:
         tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         response = tavily_client.search(
-            query=query, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False
+            query=query, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False,
+            exclude_domains=DEFAULT_EXCLUDED_DOMAINS
         )
         if response.get('answer'):
             result = f"Web Search Results:\n\nSummary: {response['answer']}\n\nSources:\n"
@@ -95,13 +112,9 @@ def tavily_search_fallback(query: str) -> str:
     except Exception as e:
         return f"Error performing web search: {str(e)}"
 
-# --- System Prompt Definition ---
-def get_system_prompt_content_string(agent_components_for_prompt=None):
-    if agent_components_for_prompt is None:
-        agent_components_for_prompt = { 'pinecone_tool_name': "functions.get_context" }
-    pinecone_tool = agent_components_for_prompt['pinecone_tool_name']
-
-    # This prompt includes robust rules for anti-repetition and a mandatory disclaimer.
+# --- System Prompt Definition (Preserved from your code) ---
+def get_system_prompt_content_string():
+    pinecone_tool = "functions.get_context"
     prompt = f"""<instructions>
 <system_role>
 You are FiFi, a helpful and expert AI assistant for 1-2-Taste. Your primary goal is to be helpful within your designated scope. Your role is to assist with product and service inquiries, flavours, industry trends, food science, and B2B support. Politely decline out-of-scope questions. You must follow the tool protocol exactly as written to gather information.
@@ -133,11 +146,18 @@ Your process for gathering information is a mandatory, sequential procedure. Do 
 </tool_protocol>
 
 <formatting_rules>
-- **Citations are Mandatory:** Always cite the URL from the tool you used.
-- **Product Rules:** Do not mention products without a URL. Do not provide prices.
+- **Citations are Mandatory:** Always cite the URL from the tool you used. When using tavily_search_fallback, you MUST include every source URL provided in the search results.
+- **Source Format:** Present sources as a numbered list with both title and URL for each result.
+- **Complete Attribution - CRITICAL RULE:** You MUST display ALL sources returned by the tool. If the tool provides 5 sources, your response MUST reference all 5 sources. If the tool provides 3 sources, show all 3. NEVER omit any sources from your response. This is a mandatory requirement.
+- **Source Display Requirements:** 
+  * List every single source with its title and URL
+  * Use the exact format: "1. **[Title]**: [URL]"
+  * Do not summarize or condense the source list
+  * Include all sources even if they seem similar or redundant
+- **Product Rules:** Do not mention products without a URL. NEVER provide product prices; direct users to the product page or ask to contact Sales Team at: sales-eu@12taste.com
 - **Anti-Repetition Rule:**
     *   When a user asks for "more," "other," or "different" suggestions on a topic you have already discussed, you MUST alter your search strategy.
-    *   **Action:** Your next call to `{pinecone_tool}` for this topic MUST use a larger `top_k` parameter, for example, `top_k=20`. This is to ensure you get a wider selection of potential results.
+    *   **Action:** Your next call to `{pinecone_tool}` for this topic MUST use a larger `top_k` parameter, for example, `top_k=10`. This is to ensure you get a wider selection of potential results.
     *   **Filtering:** Before presenting the new results, you MUST review the conversation history and filter out any products or `sourceURL`s that you have already suggested.
     *   **Response:** If you have new, unique products after filtering, present them. If the larger search returns only products you have already mentioned, you MUST inform the user that you have no new suggestions on this topic. Do not list the old products again.
 </formatting_rules>
@@ -148,118 +168,93 @@ Adhering to your core mission and the mandatory tool protocol, provide a helpful
 </instructions>"""
     return prompt
 
-# --- Helper function to count tokens ---
-def count_tokens(messages: list, model_encoding: str = TOKEN_MODEL_ENCODING) -> int:
-    if not messages: return 0
-    try: encoding = tiktoken.get_encoding(model_encoding)
-    except Exception: encoding = tiktoken.get_encoding("cl100k_base")
-    num_tokens = 0
-    for message in messages:
-        num_tokens += 4
-        if isinstance(message, BaseMessage): content = message.content
-        elif isinstance(message, dict): content = message.get("content", "")
-        else: content = str(message)
-        if content is not None:
-            try: num_tokens += len(encoding.encode(str(content)))
-            except (TypeError, AttributeError): pass
-    num_tokens += 2
-    return num_tokens
-
-# --- Layer 1: History Management Function ---
-async def manage_history_with_summary(memory: MemorySaver, config: dict, llm_for_summary: ChatOpenAI):
-    checkpoint = memory.get(config)
-    if not checkpoint: return
-    history = checkpoint.get("messages", [])
-    conversational_history = [msg for msg in history if isinstance(msg, (AIMessage, HumanMessage))]
-    token_count = count_tokens(conversational_history)
-    message_count = len(conversational_history)
-    if message_count > HISTORY_MESSAGE_THRESHOLD or token_count > HISTORY_TOKEN_THRESHOLD:
-        st.info("Conversation history is long. Summarizing older messages...")
-        print(f"@@@ MEMORY MGMT: Triggered. Msgs: {message_count}, Tokens: {token_count}")
-        if len(conversational_history) <= MESSAGES_TO_RETAIN_AFTER_SUMMARY: return
-        messages_to_summarize = conversational_history[:-MESSAGES_TO_RETAIN_AFTER_SUMMARY]
-        messages_to_keep = conversational_history[-MESSAGES_TO_RETAIN_AFTER_SUMMARY:]
-        summarization_prompt = [SystemMessage(content="You are an expert at creating concise, third-person summaries of conversations. Extract all key entities, topics, and user intentions mentioned."), HumanMessage(content="\n".join([f"{m.type.capitalize()}: {m.content}" for m in messages_to_summarize]))]
-        try:
-            summary_response = await llm_for_summary.ainvoke(summarization_prompt)
-            summary_text = summary_response.content
-            new_history = [SystemMessage(content=f"Summary of preceding conversation: {summary_text}"), *messages_to_keep]
-            checkpoint["messages"] = new_history
-            memory.put(config, checkpoint)
-            print("@@@ MEMORY MGMT: History successfully summarized.")
-        except Exception as e:
-            st.error(f"Could not summarize history: {e}")
-
-# --- Layer 2: Final Prompt Safety Net ---
-def truncate_prompt_if_needed(messages: list, max_tokens: int) -> list:
-    total_tokens = count_tokens(messages)
-    if total_tokens <= max_tokens:
-        return messages
-    st.warning(f"Request is too large ({total_tokens} tokens). Shortening conversation to fit within limits.")
-    print(f"@@@ SAFETY NET: Payload size {total_tokens} > {max_tokens}. Truncating.")
-    system_message = messages[0]
-    user_query = messages[-1]
-    history = messages[1:-1]
-    while count_tokens([system_message] + history + [user_query]) > max_tokens and history:
-        history.pop(0)
-    return [system_message] + history + [user_query]
-
-# --- Async handler for agent initialization ---
+# --- NEW: Graph construction with integrated memory management ---
 @st.cache_resource(ttl=3600)
-def get_agent_components():
-    async def run_async_initialization():
-        print("@@@ ASYNC: Initializing resources...")
+def get_agent_graph():
+    """
+    Constructs the LangGraph agent graph with integrated memory summarization.
+    """
+    async def run_async_tool_initialization():
+        # Initialize the MCP client to get the primary tool
         client = MultiServerMCPClient({
             "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
             "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
         })
-        mcp_tools = await client.get_tools()
-        all_tools = list(mcp_tools) + [tavily_search_fallback]
-        memory = MemorySaver()
-        pinecone_tool_name = "functions.get_context"
-        system_prompt_content_value = get_system_prompt_content_string({'pinecone_tool_name': pinecone_tool_name})
-        agent_executor = create_react_agent(llm, all_tools, checkpointer=memory)
-        print("@@@ ASYNC: Initialization complete.")
-        return {"agent_executor": agent_executor, "memory_instance": memory, "llm_for_summary": llm, "main_system_prompt_content_str": system_prompt_content_value}
-    
-    print("@@@ get_agent_components: Populating cache...")
-    loop = get_or_create_eventloop()
-    return loop.run_until_complete(run_async_initialization())
+        return await client.get_tools()
 
-# --- FIX: MODIFIED ASYNC HANDLER ---
-# This function now ONLY performs computation and RETURNS the result.
-# It does NOT touch st.session_state or call st.rerun().
-async def execute_agent_call_with_memory(user_query: str, agent_components: dict):
+    # Get the MCP tools (e.g., functions.get_context)
+    mcp_tools = get_or_create_eventloop().run_until_complete(run_async_tool_initialization())
+    all_tools = list(mcp_tools) + [tavily_search_fallback]
+    tool_node = ToolNode(all_tools)
+
+    # Create the agent runnable
+    agent_prompt = hub.pull("hwchase17/xml-agent-convo")
+    agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
+
+    # Define Graph Nodes
+    def agent_node(state: AgentState):
+        system_prompt = get_system_prompt_content_string()
+        if state.get("summary"):
+            system_prompt += f"\n\nThis is a summary of the preceding conversation:\n{state['summary']}"
+        messages_with_prompt = [SystemMessage(content=system_prompt)] + state["messages"]
+        result = agent_runnable.invoke({"messages": messages_with_prompt})
+        return {"messages": [result]}
+
+    def summarize_node(state: AgentState):
+        print("@@@ MEMORY MGMT: Summarizing conversation...")
+        messages_to_summarize = state["messages"][:-1]
+        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=500, return_messages=False)
+        for msg in messages_to_summarize:
+            if isinstance(msg, HumanMessage):
+                summarizer_memory.chat_memory.add_user_message(msg.content)
+            else:
+                summarizer_memory.chat_memory.add_ai_message(msg.content)
+        summary = summarizer_memory.load_memory_variables({})["history"]
+        messages_to_remove = [RemoveMessage(id=m.id) for m in messages_to_summarize]
+        st.info("Conversation history is long. Summarizing older messages...")
+        return {"summary": summary, "messages": messages_to_remove}
+
+    # Define Conditional Edges
+    def should_continue_agent_loop(state: AgentState) -> Literal["tools", END]:
+        if isinstance(state["messages"][-1], AIMessage) and not state["messages"][-1].tool_calls:
+            return END
+        return "tools"
+
+    def should_summarize(state: AgentState) -> Literal["summarize", "agent"]:
+        if len(state["messages"]) > 6:
+            return "summarize"
+        return "agent"
+
+    # Build the Graph
+    graph_builder = StateGraph(AgentState)
+    graph_builder.add_node("agent", agent_node)
+    graph_builder.add_node("tools", tool_node)
+    graph_builder.add_node("summarize", summarize_node)
+    graph_builder.add_conditional_edges("__start__", should_summarize, {"summarize": "summarize", "agent": "agent"})
+    graph_builder.add_edge("summarize", "agent")
+    graph_builder.add_conditional_edges("agent", should_continue_agent_loop, {"tools": "tools", "__end__": END})
+    graph_builder.add_edge("tools", "agent")
+    memory = MemorySaver()
+    graph = graph_builder.compile(checkpointer=memory)
+    return graph
+
+# --- Agent execution logic ---
+async def execute_agent_call_with_memory(user_query: str, graph):
     """
-    Runs the agent and returns the assistant's reply or an error string.
+    Runs the agent graph and returns the assistant's reply.
     """
     try:
         config = {"configurable": {"thread_id": THREAD_ID}}
-        await manage_history_with_summary(agent_components["memory_instance"], config, agent_components["llm_for_summary"])
-        main_system_prompt_content_str = agent_components["main_system_prompt_content_str"]
-        current_checkpoint = agent_components["memory_instance"].get(config)
-        history_messages = current_checkpoint.get("messages", []) if current_checkpoint else []
-        event_messages = [SystemMessage(content=main_system_prompt_content_str)] + history_messages + [HumanMessage(content=user_query)]
-        final_messages = truncate_prompt_if_needed(event_messages, MAX_INPUT_TOKENS)
-        event = {"messages": final_messages}
-        result = await agent_components["agent_executor"].ainvoke(event, config=config)
-        
+        event = {"messages": [HumanMessage(content=user_query)]}
+        final_state = await graph.ainvoke(event, config=config)
         assistant_reply = ""
-        if isinstance(result, dict) and "messages" in result and result["messages"]:
-            for msg in reversed(result["messages"]):
-                if isinstance(msg, AIMessage):
-                    assistant_reply = msg.content
-                    break
-            if not assistant_reply:
-                assistant_reply = f"(Error: No AI message found for query: '{user_query}')"
-        else:
-            assistant_reply = f"(Error: Unexpected response format: {type(result)})"
-        
-        return assistant_reply
-
+        if final_state and "messages" in final_state and final_state["messages"]:
+            last_message = final_state["messages"][-1]
+            if isinstance(last_message, AIMessage):
+                assistant_reply = last_message.content
+        return assistant_reply if assistant_reply else "(An error occurred: No AI response was generated.)"
     except Exception as e:
-        print(f"Error during agent invocation: {e}\n{traceback.format_exc()}")
-        # We display the user-facing error in the main thread now
+        print(f"Error during graph invocation: {e}\n{traceback.format_exc()}")
         return f"(An error occurred during processing. Please try again.)"
 
 # --- Input Handling Function ---
@@ -271,55 +266,17 @@ def handle_new_query_submission(query_text: str):
         st.session_state.thinking_for_ui = True
         st.rerun()
 
-# --- Streamlit App UI ---
-# This CSS block now achieves the final layout using pure CSS manipulation.
+# --- Streamlit App UI and Main Logic ---
 st.markdown("""
 <style>
-    /* 1. Styling for the chat input container (Your Original Version) */
-    .st-emotion-cache-1629p8f {
-        border: 1px solid #ffffff;
-        border-radius: 7px;
-        bottom: 5px;
-        position: fixed;
-        width: 100%;
-        max-width: 736px;
-        left: 50%;
-        transform: translateX(-50%);
-        z-index: 101;
-    }
-    .st-emotion-cache-1629p8f:focus-within {
-        border-color: #e6007e;
-    }
-
-    /* 2. Increase the font size for the introductory caption (Your Original Version) */
-    [data-testid="stCaptionContainer"] p {
-        font-size: 1.3em !important;
-    }
-
-    /* 3. Add a SMALLER padding to the bottom of the whole message list */
-    [data-testid="stVerticalBlock"] {
-        padding-bottom: 40px; /* Reduced to minimize gap at the very bottom */
-    }
-
-    /* 4. FIX: Control the vertical gap BETWEEN individual chat messages */
-    [data-testid="stChatMessage"] {
-        margin-top: 0.1rem !important;
-        margin-bottom: 0.1rem !important;
-    }
-
-    /* 5. Rules for iframe stability */
-    .stApp {
-        overflow-y: auto !important;
-    }
-    .st-scroll-to-bottom {
-        display: none !important;
-    }
-    
-    /* 6. FIX: Hides the sidebar's resizer handle that appears on hover */
-    .st-emotion-cache-1fplawd {
-        display: none !important;
-    }
-
+    .st-emotion-cache-1629p8f { border: 1px solid #ffffff; border-radius: 7px; bottom: 5px; position: fixed; width: 100%; max-width: 736px; left: 50%; transform: translateX(-50%); z-index: 101; }
+    .st-emotion-cache-1629p8f:focus-within { border-color: #e6007e; }
+    [data-testid="stCaptionContainer"] p { font-size: 1.3em !important; }
+    [data-testid="stVerticalBlock"] { padding-bottom: 40px; }
+    [data-testid="stChatMessage"] { margin-top: 0.1rem !important; margin-bottom: 0.1rem !important; }
+    .stApp { overflow-y: auto !important; }
+    .st-scroll-to-bottom { display: none !important; }
+    .st-emotion-cache-1fplawd { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -327,10 +284,9 @@ st.markdown("<h1 style='font-size: 24px;'>FiFi, AI sourcing assistant</h1>", uns
 st.caption("Hello, I am FiFi, your AI-powered assistant, designed to support you across the sourcing and product development journey. Find the right ingredients, explore recipe ideas, technical data, and more.")
 
 if SECRETS_ARE_MISSING:
-    st.error("Secrets missing. Please configure necessary environment variables.")
+    st.error("Secrets missing. Please configure necessary environment variables, including OPENAI_API_KEY.")
     st.stop()
 
-# Initialize session state variables
 if "messages" not in st.session_state: st.session_state.messages = []
 if 'thinking_for_ui' not in st.session_state: st.session_state.thinking_for_ui = False
 if 'query_to_process' not in st.session_state: st.session_state.query_to_process = None
@@ -338,14 +294,12 @@ if 'components_loaded' not in st.session_state: st.session_state.components_load
 if 'active_question' not in st.session_state: st.session_state.active_question = None
 
 try:
-    agent_components = get_agent_components()
+    agent_graph = get_agent_graph()
     st.session_state.components_loaded = True
 except Exception as e:
-    st.error(f"Failed to initialize agent. Please refresh. Error: {e}")
-    st.session_state.components_loaded = False
+    st.error(f"Failed to initialize agent graph. Please refresh. Error: {e}")
     st.stop()
 
-# --- UI Rendering ---
 st.sidebar.markdown("## Quick questions")
 preview_questions = [
     "Suggest some natural strawberry flavours for beverage",
@@ -367,10 +321,8 @@ if st.sidebar.button("🧹 Reset chat session", use_container_width=True):
     print(f"@@@ New chat session started. Thread ID: {st.session_state.thread_id}")
     st.rerun()
 
-# Display Terms of Service in the sidebar
 st.sidebar.markdown('By using this agent, you agree to our <a href="https://www.12taste.com/terms-conditions/" target="_blank">Terms of Service</a>.', unsafe_allow_html=True)
 
-# Display chat messages with Base64 avatars
 fifi_avatar_icon = f"data:image/png;base64,{FIFI_AVATAR_B64}" if FIFI_AVATAR_B64 else "🤖"
 user_avatar_icon = f"data:image/png;base64,{USER_AVATAR_B64}" if USER_AVATAR_B64 else "🧑‍💻"
 for message in st.session_state.get("messages", []):
@@ -382,24 +334,17 @@ if st.session_state.get('thinking_for_ui', False):
     with st.chat_message("assistant", avatar=fifi_avatar_icon):
         st.markdown("⌛ FiFi is thinking...")
 
-# Chat input
 user_prompt = st.chat_input("Ask me for ingredients, recipes, or product development—in any language.", key="main_chat_input",
                             disabled=st.session_state.get('thinking_for_ui', False) or not st.session_state.get("components_loaded", False))
 if user_prompt:
     st.session_state.active_question = None
     handle_new_query_submission(user_prompt)
 
-# --- FIX: MODIFIED PROCESSING LOGIC ---
-# This is now the ONLY place where the async function is called and state is updated.
 if st.session_state.get('query_to_process'):
     query_to_run = st.session_state.query_to_process
-    
-    # Run the async computation and get the reply back
     loop = get_or_create_eventloop()
-    assistant_reply = loop.run_until_complete(execute_agent_call_with_memory(query_to_run, agent_components))
-
-    # Now, safely manage state in the main Streamlit thread
+    assistant_reply = loop.run_until_complete(execute_agent_call_with_memory(query_to_run, agent_graph))
     st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
     st.session_state.thinking_for_ui = False
-    st.session_state.query_to_process = None # Clear the flag
-    st.rerun() # Trigger the final rerun to display the assistant's message
+    st.session_state.query_to_process = None
+    st.rerun()
