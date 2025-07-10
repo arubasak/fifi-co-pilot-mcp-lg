@@ -19,8 +19,7 @@ from langchain_openai import ChatOpenAI
 from langchain import hub
 from langchain.agents import create_tool_calling_agent
 from langgraph.prebuilt import ToolNode
-from langchain_core.agents import AgentAction, AgentFinish 
-# --- FIXED: Added missing import for ChatPromptTemplate and MessagesPlaceholder ---
+from langchain_core.agents import AgentAction, AgentFinish
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage, BaseMessage
 from langchain_core.tools import tool
@@ -63,8 +62,8 @@ class AgentState(TypedDict):
 # Load environment variables
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY") 
-PINECONE_ASSISTANT_NAME = os.environ.get("PINECONE_ASSISTANT_NAME") 
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+PINECONE_ASSISTANT_NAME = os.environ.get("PINECONE_ASSISTANT_NAME")
 
 SECRETS_ARE_MISSING = not all([OPENAI_API_KEY, TAVILY_API_KEY, PINECONE_API_KEY, PINECONE_ASSISTANT_NAME])
 
@@ -90,7 +89,7 @@ def get_context(query: str, top_k: int = 5, snippet_size: int = 1024) -> str:
         for i, snippet in enumerate(response.snippets, 1):
             file_name = snippet.reference.get("file", {}).get("name", "N/A")
             source_url = snippet.reference.get("file", {}).get("signed_url", "N/A")
-            
+
             result += f"{i}. Source: {file_name}\n   URL: {source_url}\n   Snippet: {snippet.content}\n\n"
         return result
     except Exception as e:
@@ -113,57 +112,50 @@ def tavily_search_fallback(query: str) -> str:
             query=query, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False,
             exclude_domains=DEFAULT_EXCLUDED_DOMAINS
         )
-        
+
         formatted_output = ""
         if response.get('answer'):
             formatted_output += f"Web Search Summary: {response['answer']}\n\n"
-        
+
         if response.get('results'):
             formatted_output += "Sources:\n"
             for i, source in enumerate(response['results'], 1):
                 formatted_output += f"1. **{source.get('title', 'No Title')}**: {source.get('url', 'No URL')}\n"
-        
+
         return formatted_output if formatted_output else "No relevant information found via web search."
     except Exception as e: return f"Error performing web search: {str(e)}"
 
 # System Prompt Definition
 def get_system_prompt_content_string():
-    pinecone_tool = "get_context" # Referencing the new tool name
+    pinecone_tool = "get_context"
     prompt = f"""<instructions>
 <system_role>
 You are FiFi, a helpful and expert AI assistant for 1-2-Taste. Your primary goal is to be helpful within your designated scope. Your role is to assist with product and service inquiries, flavours, industry trends, food science, and B2B support. Politely decline out-of-scope questions. You must follow the tool protocol exactly as written to gather information.
 </system_role>
-
 <core_mission_and_scope>
 Your mission is to provide information and support on 1-2-Taste products, the food and beverage industry, food science, and related B2B support. Use the conversation history to understand the user's intent, especially for follow-up questions.
 </core_mission_and_scope>
-
 <tool_protocol>
 Your process for gathering information is a mandatory, sequential procedure. Do not deviate.
-
 1.  **Step 1: Primary Tool Execution.**
     *   For any user query, your first and only initial action is to call the `{pinecone_tool}`.
     *   **Parameters:** Unless specified by a different rule (like the Anti-Repetition Rule), you MUST use `top_k=5` and `snippet_size=1024`.
-
 2.  **Step 2: Mandatory Result Analysis.**
     *   After the primary tool returns a result, you MUST analyze it against the failure conditions below.
-
 3.  **Step 3: Conditional Fallback Execution.**
     *   **If** the primary tool fails (because the result is empty, irrelevant, or lacks a `sourceURL`/`productURL`), then your next and only action **MUST** be to call the `tavily_search_fallback` tool with the original user query.
     *   Do not stop or apologize after a primary tool failure. The fallback call is a required part of the procedure.
-
 4.  **Step 4: Final Answer Formulation.**
     *   Formulate your answer based on the data from the one successful tool call (either the primary or the fallback).
     *   **Disclaimer Rule:** If your answer is based on results from `tavily_search_fallback`, you **MUST** begin your response with this exact disclaimer, enclosed in a markdown quote block:
         > I could not find specific results within the 1-2-Taste EU product database. The following information is from a general web search and may point to external sites not affiliated with 1-2-Taste.
     *   If both tools fail, only then should you state that you could not find the information.
 </tool_protocol>
-
 <formatting_rules>
 - **Citations are Mandatory:** Always cite the URL from the tool you used. When using tavily_search_fallback, you MUST include every source URL provided in the search results.
 - **Source Format:** Present sources as a numbered list with both title and URL for each result.
 - **Complete Attribution - CRITICAL RULE:** You MUST display ALL sources returned by the tool. If the tool provides 5 sources, your response MUST reference all 5 sources. If the tool provides 3 sources, show all 3. NEVER omit any sources from your response. This is a mandatory requirement.
-- **Source Display Requirements:** 
+- **Source Display Requirements:**
   * List every single source with its title and URL
   * Use the exact format: "1. **[Title]**: [URL]"
   * Do not summarize or condense the source list
@@ -175,7 +167,6 @@ Your process for gathering information is a mandatory, sequential procedure. Do 
     *   **Filtering:** Before presenting the new results, you MUST review the conversation history and filter out any products or `sourceURL`s that you have already suggested.
     *   **Response:** If you have new, unique products after filtering, present them. If the larger search returns only products you have already mentioned, you MUST inform the user that you have no new suggestions on this topic. Do not list the old products again.
 </formatting_rules>
-
 <final_instruction>
 Adhering to your core mission and the mandatory tool protocol, provide a helpful and context-aware response to the user's query.
 </final_instruction>
@@ -187,71 +178,100 @@ Adhering to your core mission and the mandatory tool protocol, provide a helpful
 def get_agent_graph():
     """Constructs the unified LangGraph agent with integrated memory."""
     all_tools = [get_context, tavily_search_fallback]
-    tool_node = ToolNode(all_tools) 
-    
-    # This is the agent's brain, created once and reused.
+    tool_node = ToolNode(all_tools)
+
     system_prompt_content = get_system_prompt_content_string()
-    # --- MODIFIED: Custom ChatPromptTemplate with correct placeholders ---
     agent_prompt_template = ChatPromptTemplate.from_messages(
         [
-            ("system", system_prompt_content), # Your custom system prompt is ALWAYS first
-            MessagesPlaceholder("chat_history", optional=True), # History comes next
-            ("human", "{input}"), # New user input
-            MessagesPlaceholder("agent_scratchpad", optional=True), # Agent's thoughts and tool outputs
-            # --- Removed: MessagesPlaceholder("tools", optional=True) as it's handled internally ---
+            ("system", system_prompt_content),
+            MessagesPlaceholder("chat_history", optional=True),
+            ("human", "{input}"),
+            MessagesPlaceholder("agent_scratchpad", optional=True),
         ]
     )
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt_template)
-    
-    # Define Graph Nodes (nested so they can access agent_runnable, llm, all_tools etc.)
+
+    # --- CORRECTED agent_node ---
     def agent_node(state: AgentState):
-        """Runs the agent runnable with the current state."""
-        chat_history = state["messages"][:-1]
-        input_text = state["messages"][-1].content
-        
-        # Explicitly prepend summary as a SystemMessage if it exists
+        """
+        Runs the agent runnable with the current state, correctly parsing messages
+        into history, input, and intermediate_steps.
+        """
+        current_messages = state["messages"]
+
+        # Find the last HumanMessage to demarcate the current turn
+        last_human_idx = -1
+        for i in range(len(current_messages) - 1, -1, -1):
+            if isinstance(current_messages[i], HumanMessage):
+                last_human_idx = i
+                break
+
+        if last_human_idx == -1:
+            raise ValueError("No HumanMessage found in state. The agent requires a human input to proceed.")
+
+        # Partition messages into history, input, and the current turn's scratchpad
+        current_input = current_messages[last_human_idx].content
+        chat_history = current_messages[:last_human_idx]
+        agent_scratchpad_messages = current_messages[last_human_idx + 1:]
+
+        # Convert the scratchpad messages into the (AgentAction, ToolMessage) format
+        intermediate_steps = []
+        i = 0
+        while i < len(agent_scratchpad_messages):
+            if isinstance(agent_scratchpad_messages[i], AIMessage) and agent_scratchpad_messages[i].tool_calls:
+                ai_msg = agent_scratchpad_messages[i]
+                # Check if there is a corresponding tool message
+                if (i + 1) < len(agent_scratchpad_messages) and isinstance(agent_scratchpad_messages[i+1], ToolMessage):
+                    tool_msg = agent_scratchpad_messages[i + 1]
+                    if tool_msg.tool_call_id == ai_msg.tool_calls[0]['id']:
+                        action = AgentAction(
+                            tool=ai_msg.tool_calls[0]['name'],
+                            tool_input=ai_msg.tool_calls[0]['args'],
+                            log=f"Invoking tool {ai_msg.tool_calls[0]['name']} with args {ai_msg.tool_calls[0]['args']}",
+                            tool_call_id=ai_msg.tool_calls[0]['id']
+                        )
+                        intermediate_steps.append((action, tool_msg))
+                        i += 2
+                        continue
+                # If no corresponding tool message is found, or pairing is incorrect, skip
+                i += 1
+            else:
+                i += 1
+
+        # Prepend summary if it exists
         if state.get("summary"):
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
-        
-        # Invoke the agent with all required keys
+
+        # Invoke the agent with the correctly structured inputs
         agent_output_raw = agent_runnable.invoke({
             "chat_history": chat_history,
-            "input": input_text,
-            "intermediate_steps": [], # Required by the prompt template
-            "tools": all_tools # Required by the prompt template. Yes, add it here for agent_runnable.invoke
+            "input": current_input,
+            "intermediate_steps": intermediate_steps
         })
 
-        # Robustly convert agent_runnable output to List[BaseMessage]
+        # Process the agent's output
         processed_messages = []
-        # agent_runnable.invoke usually returns a single item directly, not a list.
-        # But if it's a list, process each item.
         output_items = agent_output_raw if isinstance(agent_output_raw, list) else [agent_output_raw]
-
         for item in output_items:
-            # Check for attributes that define AgentAction (more robust than isinstance for version quirks)
             if hasattr(item, 'tool') and hasattr(item, 'tool_input') and hasattr(item, 'log'):
                 processed_messages.append(AIMessage(
-                    content="", 
+                    content="",
                     tool_calls=[{"name": item.tool, "args": item.tool_input, "id": getattr(item, 'tool_call_id', str(uuid.uuid4()))}]
                 ))
-            # Check for attributes that define AgentFinish
             elif hasattr(item, 'return_values') and isinstance(getattr(item, 'return_values', None), dict):
                 processed_messages.append(AIMessage(content=item.return_values.get('output', '')))
-            # If it's already a BaseMessage, simply append it
             elif isinstance(item, BaseMessage):
                 processed_messages.append(item)
             else:
-                # Fallback for truly unexpected types - this should ideally not be hit
                 raise ValueError(f"Agent runnable returned an item of unexpected type: {type(item)}. Content: {item}")
 
         return {"messages": processed_messages}
 
-
     def summarize_node(state: AgentState):
         """Summarizes the history and prunes old messages."""
         messages_to_summarize = state["messages"][:-1]
-        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False) 
+        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False)
         for msg in messages_to_summarize:
             if isinstance(msg, HumanMessage): summarizer_memory.chat_memory.add_user_message(msg.content)
             else: summarizer_memory.chat_memory.add_ai_message(msg.content)
@@ -277,13 +297,13 @@ def get_agent_graph():
     graph_builder = StateGraph(AgentState)
     graph_builder.add_node("summarize", summarize_node)
     graph_builder.add_node("agent", agent_node)
-    graph_builder.add_node("tools", tool_node) 
-    
+    graph_builder.add_node("tools", tool_node)
+
     graph_builder.add_conditional_edges("__start__", should_summarize, {"summarize": "summarize", "agent": "agent"})
     graph_builder.add_edge("summarize", "agent")
-    graph_builder.add_conditional_edges("agent", should_continue_agent_loop, {"tools": "tools", END: END}) 
+    graph_builder.add_conditional_edges("agent", should_continue_agent_loop, {"tools": "tools", END: END})
     graph_builder.add_edge("tools", "agent")
-    
+
     memory = MemorySaver()
     graph = graph_builder.compile(checkpointer=memory)
     return graph
@@ -295,8 +315,7 @@ async def execute_agent_call_with_memory(user_query: str, graph):
         config = {"configurable": {"thread_id": THREAD_ID}}
         event = {"messages": [HumanMessage(content=user_query)]}
         final_state = await graph.ainvoke(event, config=config)
-        
-        # The final message is the one we want to display
+
         assistant_reply = final_state["messages"][-1].content
         return assistant_reply if assistant_reply else "(No response was generated.)"
     except Exception as e:
