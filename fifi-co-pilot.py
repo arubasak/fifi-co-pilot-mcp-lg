@@ -185,24 +185,25 @@ def get_agent_graph():
     all_tools = list(mcp_tools) + [tavily_search_fallback]
     tool_node = ToolNode(all_tools)
 
-    # --- MODIFIED: Properly bake the system prompt into the agent's prompt template ---
-    # This is the correct way to set the agent's core instructions.
     system_prompt = get_system_prompt_content_string()
     agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
 
-    # --- MODIFIED: Rewritten agent_node to provide the correct input structure ---
     def agent_node(state: AgentState):
         """The 'think' node. Calls the LLM to decide the next action."""
-        # The agent expects a dictionary with 'input' and 'chat_history' keys
         chat_history = state["messages"][:-1]
         input_text = state["messages"][-1].content
         
-        # Dynamically add the summary to the chat history for the agent's context
         if state.get("summary"):
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
-
+        
+        # --- DEBUG --- Added print statement to check the input being sent to the agent
+        print("--- DEBUG: AGENT NODE INPUT ---")
+        print(f"Chat History: {chat_history}")
+        print(f"Input Text: {input_text}")
+        print("------------------------------")
+        
         result = agent_runnable.invoke({
             "chat_history": chat_history,
             "input": input_text
@@ -213,6 +214,12 @@ def get_agent_graph():
         """The 'summarize' node. Creates a summary and prunes old messages."""
         print("@@@ MEMORY MGMT: Summarizing conversation...")
         messages_to_summarize = state["messages"][:-1]
+        
+        # --- DEBUG --- Added print statement to see what messages are being summarized
+        print("--- DEBUG: SUMMARIZE NODE ---")
+        print(f"Messages to Summarize: {messages_to_summarize}")
+        print("---------------------------")
+        
         summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=500, return_messages=False)
         for msg in messages_to_summarize:
             if isinstance(msg, HumanMessage):
@@ -224,7 +231,6 @@ def get_agent_graph():
         st.info("Conversation history is long. Summarizing older messages...")
         return {"summary": summary, "messages": messages_to_remove}
 
-    # Define Conditional Edges
     def should_continue_agent_loop(state: AgentState) -> Literal["tools", END]:
         if isinstance(state["messages"][-1], AIMessage) and not state["messages"][-1].tool_calls:
             return END
@@ -235,7 +241,6 @@ def get_agent_graph():
             return "summarize"
         return "agent"
 
-    # Build the Graph
     graph_builder = StateGraph(AgentState)
     graph_builder.add_node("agent", agent_node)
     graph_builder.add_node("tools", tool_node)
@@ -248,15 +253,19 @@ def get_agent_graph():
     graph = graph_builder.compile(checkpointer=memory)
     return graph
 
-# --- Agent execution logic ---
+# --- DEBUG: MODIFIED AGENT EXECUTION LOGIC TO SHOW THE FULL ERROR ---
 async def execute_agent_call_with_memory(user_query: str, graph):
     """
-    Runs the agent graph and returns the assistant's reply.
+    Runs the agent graph and returns the assistant's reply OR the full error traceback.
     """
     try:
         config = {"configurable": {"thread_id": THREAD_ID}}
         event = {"messages": [HumanMessage(content=user_query)]}
+        
+        print("--- DEBUG: INVOKING GRAPH ---")
         final_state = await graph.ainvoke(event, config=config)
+        print("--- DEBUG: GRAPH INVOCATION COMPLETE ---")
+        
         assistant_reply = ""
         if final_state and "messages" in final_state and final_state["messages"]:
             last_message = final_state["messages"][-1]
@@ -264,8 +273,14 @@ async def execute_agent_call_with_memory(user_query: str, graph):
                 assistant_reply = last_message.content
         return assistant_reply if assistant_reply else "(An error occurred: No AI response was generated.)"
     except Exception as e:
-        print(f"Error during graph invocation: {e}\n{traceback.format_exc()}")
-        return f"(An error occurred during processing. Please try again.)"
+        # This will now capture the full error and format it as a string
+        # to be displayed directly in the chat window.
+        print(f"--- ERROR: Exception caught during graph invocation! ---")
+        # The full traceback will be printed to the Streamlit log
+        traceback.print_exc()
+        # The formatted traceback will be returned to the UI
+        error_message = f"**An error occurred during processing:**\n\n```\n{traceback.format_exc()}\n```"
+        return error_message
 
 # --- Input Handling Function ---
 def handle_new_query_submission(query_text: str):
