@@ -19,8 +19,8 @@ from langchain_openai import ChatOpenAI
 from langchain import hub
 from langchain.agents import create_tool_calling_agent
 from langgraph.prebuilt import ToolNode
-# --- NEW: Import AgentAction and AgentFinish for type checking ---
-from langchain_core.agents import AgentAction, AgentFinish
+# --- REMOVED: AgentAction and AgentFinish imports as they are no longer directly handled here ---
+# from langchain_core.agents import AgentAction, AgentFinish # No longer needed
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage, BaseMessage
@@ -155,12 +155,11 @@ def get_agent_graph():
 
     mcp_tools = get_or_create_eventloop().run_until_complete(run_async_tool_initialization())
     all_tools = list(mcp_tools) + [tavily_search_fallback]
-    tool_node = ToolNode(all_tools) # This needs all_tools
+    tool_node = ToolNode(all_tools)
     
     # This is the agent's brain, created once and reused.
     system_prompt = get_system_prompt_content_string()
     agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
-    # The agent_runnable is created once for the graph
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
     
     # Define Graph Nodes (nested so they can access agent_runnable, llm, all_tools etc.)
@@ -173,28 +172,24 @@ def get_agent_graph():
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
         
-        # Invoke the agent with all required keys
-        agent_output = agent_runnable.invoke({
+        # --- CRITICAL FIX: agent_runnable.invoke() now returns a list of BaseMessage ---
+        # We pass the full context and all required parameters.
+        result_messages_list = agent_runnable.invoke({
             "chat_history": chat_history,
             "input": input_text,
             "intermediate_steps": [], # Required by the prompt template
             "tools": all_tools # Required by the prompt template
         })
 
-        # --- CRITICAL FIX: Convert AgentAction/AgentFinish to BaseMessage ---
-        if isinstance(agent_output, AgentAction):
-            # If the LLM decided to call a tool, represent it as an AIMessage with tool_calls
-            # This is how LangChain agents typically represent tool-calling outputs in messages
-            return {"messages": [AIMessage(
-                content=f"Calling tool: {agent_output.tool} with input: {agent_output.tool_input}",
-                tool_calls=[{"name": agent_output.tool, "args": agent_output.tool_input}]
-            )]}
-        elif isinstance(agent_output, AgentFinish):
-            # If the LLM has a final answer, represent it as a standard AIMessage
-            return {"messages": [AIMessage(content=agent_output.return_values['output'])]}
-        else:
-            # Fallback for unexpected types (should not happen with create_tool_calling_agent)
-            raise ValueError(f"Unexpected agent_runnable output type: {type(agent_output)}")
+        # LangGraph's 'messages: Annotated[list, add_messages]' expects a list of BaseMessage.
+        # Since agent_runnable.invoke() now returns List[BaseMessage], we pass it directly.
+        if not isinstance(result_messages_list, list) or not all(isinstance(m, BaseMessage) for m in result_messages_list):
+             # This means the agent_runnable returned something unexpected, e.g., AgentAction/AgentFinish directly
+             # This usually means an issue with the agent parsing or the model's output format.
+             # For a create_tool_calling_agent using hub.pull("xml-agent-convo"), it should return List[BaseMessage]
+             raise ValueError(f"Agent runnable returned unexpected type: {type(result_messages_list)}. Expected List[BaseMessage]. Content: {result_messages_list}")
+
+        return {"messages": result_messages_list}
 
 
     def summarize_node(state: AgentState):
@@ -212,9 +207,10 @@ def get_agent_graph():
     def should_continue_agent_loop(state: AgentState) -> Literal["tools", END]:
         """Decides whether to call a tool or end the turn."""
         last_message = state["messages"][-1]
-        if isinstance(last_message, AIMessage) and not last_message.tool_calls:
-            return END
-        return "tools"
+        # Check if the last message is an AIMessage and contains tool_calls
+        if isinstance(last_message, AIMessage) and last_message.tool_calls:
+            return "tools"
+        return END
 
     def should_summarize(state: AgentState) -> Literal["summarize", "agent"]:
         """Decides if the conversation is long enough to summarize."""
@@ -230,7 +226,7 @@ def get_agent_graph():
     
     graph_builder.add_conditional_edges("__start__", should_summarize, {"summarize": "summarize", "agent": "agent"})
     graph_builder.add_edge("summarize", "agent")
-    graph_builder.add_conditional_edges("agent", should_continue_agent_loop, {"tools": "tools", "__end__": END})
+    graph_builder.add_conditional_edges("agent", should_continue_agent_loop, {"tools": "tools", END: END}) # Explicitly map END
     graph_builder.add_edge("tools", "agent")
     
     memory = MemorySaver()
@@ -245,6 +241,7 @@ async def execute_agent_call_with_memory(user_query: str, graph):
         event = {"messages": [HumanMessage(content=user_query)]}
         final_state = await graph.ainvoke(event, config=config)
         
+        # The final message is the one we want to display
         assistant_reply = final_state["messages"][-1].content
         return assistant_reply if assistant_reply else "(No response was generated.)"
     except Exception as e:
