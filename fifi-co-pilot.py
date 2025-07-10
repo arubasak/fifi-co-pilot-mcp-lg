@@ -189,7 +189,7 @@ def get_agent_graph():
     agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
 
-    # --- MODIFIED: agent_node with the critical fix ---
+    # --- MODIFIED: agent_node with the final fix ---
     def agent_node(state: AgentState):
         """The 'think' node. Calls the LLM to decide the next action."""
         chat_history = state["messages"][:-1]
@@ -199,12 +199,13 @@ def get_agent_graph():
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
         
-        # --- THE FIX IS HERE ---
-        # The agent runnable requires the 'intermediate_steps' key, even if it's empty.
+        # --- THE FINAL FIX IS HERE ---
+        # The agent runnable requires 'tools' AND 'intermediate_steps' to be in the input dictionary.
         result = agent_runnable.invoke({
             "chat_history": chat_history,
             "input": input_text,
-            "intermediate_steps": []
+            "intermediate_steps": [],
+            "tools": all_tools
         })
         return {"messages": [result]}
 
@@ -248,10 +249,10 @@ def get_agent_graph():
     graph = graph_builder.compile(checkpointer=memory)
     return graph
 
-# --- Agent execution logic ---
+# --- Agent execution logic (reverted to non-debugging version) ---
 async def execute_agent_call_with_memory(user_query: str, graph):
     """
-    Runs the agent graph and returns the assistant's reply OR the full error traceback.
+    Runs the agent graph and returns the assistant's reply.
     """
     try:
         config = {"configurable": {"thread_id": THREAD_ID}}
@@ -264,12 +265,8 @@ async def execute_agent_call_with_memory(user_query: str, graph):
                 assistant_reply = last_message.content
         return assistant_reply if assistant_reply else "(An error occurred: No AI response was generated.)"
     except Exception as e:
-        # This will now capture the full error and format it as a string
-        # to be displayed directly in the chat window.
-        print(f"--- ERROR: Exception caught during graph invocation! ---")
-        traceback.print_exc()
-        error_message = f"**An error occurred during processing:**\n\n```\n{traceback.format_exc()}\n```"
-        return error_message
+        print(f"Error during graph invocation: {e}\n{traceback.format_exc()}")
+        return f"(An error occurred during processing. Please try again.)"
 
 # --- Input Handling Function ---
 def handle_new_query_submission(query_text: str):
