@@ -19,10 +19,7 @@ from langchain_openai import ChatOpenAI
 from langchain import hub
 from langchain.agents import create_tool_calling_agent
 from langgraph.prebuilt import ToolNode
-# --- NEW: Import AgentAction and AgentFinish for explicit type handling ---
-from langchain_core.agents import AgentAction, AgentFinish # Keep these imports
-
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.agents import AgentAction, AgentFinish
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage, BaseMessage
 from langchain_core.tools import tool
 from tavily import TavilyClient
@@ -70,11 +67,21 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 SECRETS_ARE_MISSING = not all([OPENAI_API_KEY, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREAM_URL, TAVILY_API_KEY])
 
 if not SECRETS_ARE_MISSING:
-    llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.2)
+    # --- MODIFIED: Dynamically set client_kwargs for custom headers ---
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        api_key=OPENAI_API_KEY,
+        temperature=0.2,
+        # client_kwargs={"extra_headers": {"X-Internal-Thread-ID": THREAD_ID}} # This cannot be here as THREAD_ID is not yet defined
+    )
     if 'thread_id' not in st.session_state: st.session_state.thread_id = f"fifi_streamlit_session_{uuid.uuid4()}"
     THREAD_ID = st.session_state.thread_id
+    # Re-initialize LLM once THREAD_ID is available, or pass client_kwargs dynamically if needed per call
+    # For now, it will be set in get_agent_graph or execute_agent_call_with_memory if custom logging is needed per call
+    # As get_agent_graph is @st.cache_resource, it runs once. We'll pass metadata via invoke config.
 
-# Tavily Search Tool with Exclusions
+
+# Tavily Search Tool with Exclusions (Preserved from your code)
 DEFAULT_EXCLUDED_DOMAINS = [
     "ingredientsnetwork.com", "csmingredients.com", "batafood.com", "nccingredients.com", "prinovaglobal.com", "ingrizo.com",
     "solina.com", "opply.com", "brusco.co.uk", "lehmanningredients.co.uk", "i-ingredients.com", "fciltd.com", "lupafoods.com",
@@ -94,32 +101,39 @@ def tavily_search_fallback(query: str) -> str:
         return result
     except Exception as e: return f"Error performing web search: {str(e)}"
 
-# System Prompt Definition
+# System Prompt Definition (Preserved from your code)
 def get_system_prompt_content_string():
     pinecone_tool = "functions.get_context"
     prompt = f"""<instructions>
 <system_role>
 You are FiFi, a helpful and expert AI assistant for 1-2-Taste. Your primary goal is to be helpful within your designated scope. Your role is to assist with product and service inquiries, flavours, industry trends, food science, and B2B support. Politely decline out-of-scope questions. You must follow the tool protocol exactly as written to gather information.
 </system_role>
+
 <core_mission_and_scope>
 Your mission is to provide information and support on 1-2-Taste products, the food and beverage industry, food science, and related B2B support. Use the conversation history to understand the user's intent, especially for follow-up questions.
 </core_mission_and_scope>
+
 <tool_protocol>
 Your process for gathering information is a mandatory, sequential procedure. Do not deviate.
+
 1.  **Step 1: Primary Tool Execution.**
     *   For any user query, your first and only initial action is to call the `{pinecone_tool}`.
     *   **Parameters:** Unless specified by a different rule (like the Anti-Repetition Rule), you MUST use `top_k=5` and `snippet_size=1024`.
+
 2.  **Step 2: Mandatory Result Analysis.**
     *   After the primary tool returns a result, you MUST analyze it against the failure conditions below.
+
 3.  **Step 3: Conditional Fallback Execution.**
     *   **If** the primary tool fails (because the result is empty, irrelevant, or lacks a `sourceURL`/`productURL`), then your next and only action **MUST** be to call the `tavily_search_fallback` tool with the original user query.
     *   Do not stop or apologize after a primary tool failure. The fallback call is a required part of the procedure.
+
 4.  **Step 4: Final Answer Formulation.**
     *   Formulate your answer based on the data from the one successful tool call (either the primary or the fallback).
     *   **Disclaimer Rule:** If your answer is based on results from `tavily_search_fallback`, you **MUST** begin your response with this exact disclaimer, enclosed in a markdown quote block:
         > I could not find specific results within the 1-2-Taste EU product database. The following information is from a general web search and may point to external sites not affiliated with 1-2-Taste.
     *   If both tools fail, only then should you state that you could not find the information.
 </tool_protocol>
+
 <formatting_rules>
 - **Citations are Mandatory:** Always cite the URL from the tool you used. When using tavily_search_fallback, you MUST include every source URL provided in the search results.
 - **Source Format:** Present sources as a numbered list with both title and URL for each result.
@@ -136,6 +150,7 @@ Your process for gathering information is a mandatory, sequential procedure. Do 
     *   **Filtering:** Before presenting the new results, you MUST review the conversation history and filter out any products or `sourceURL`s that you have already suggested.
     *   **Response:** If you have new, unique products after filtering, present them. If the larger search returns only products you have already mentioned, you MUST inform the user that you have no new suggestions on this topic. Do not list the old products again.
 </formatting_rules>
+
 <final_instruction>
 Adhering to your core mission and the mandatory tool protocol, provide a helpful and context-aware response to the user's query.
 </final_instruction>
@@ -151,15 +166,20 @@ def get_agent_graph():
             "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
             "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
         })
-        return await client.get_tools()
+        mcp_all_tools = await client.get_tools()
+        
+        # --- MODIFIED: Filter MCP tools to ONLY include 'functions.get_context' ---
+        # This removes unwanted tools like WooCommerce from the agent's context.
+        filtered_mcp_tools = [tool for tool in mcp_all_tools if tool.name == "functions.get_context"]
+        return filtered_mcp_tools
 
     mcp_tools = get_or_create_eventloop().run_until_complete(run_async_tool_initialization())
     all_tools = list(mcp_tools) + [tavily_search_fallback]
     tool_node = ToolNode(all_tools) 
     
     # This is the agent's brain, created once and reused.
-    system_prompt = get_system_prompt_content_string()
-    agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
+    system_prompt_content = get_system_prompt_content_string()
+    agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt_content)
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
     
     # Define Graph Nodes (nested so they can access agent_runnable, llm, all_tools etc.)
@@ -168,6 +188,7 @@ def get_agent_graph():
         chat_history = state["messages"][:-1]
         input_text = state["messages"][-1].content
         
+        # --- NEW: Explicitly prepend summary as a SystemMessage if it exists ---
         if state.get("summary"):
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
@@ -178,32 +199,32 @@ def get_agent_graph():
             "input": input_text,
             "intermediate_steps": [], # Required by the prompt template
             "tools": all_tools # Required by the prompt template
-        })
+        },
+        # --- NEW: Pass custom metadata to LLM invocation for logging correlation ---
+        config={"metadata": {"langgraph_thread_id": THREAD_ID}}
+        )
 
         # --- CRITICAL FIX: Robustly convert agent_runnable output to List[BaseMessage] ---
         # The output from create_tool_calling_agent.invoke() can be AgentAction, AgentFinish, or sometimes AIMessage.
         # We need to ensure the output to the graph state is always a List[BaseMessage].
         
         processed_messages = []
-        # Ensure agent_output_raw is iterable if it's a list; otherwise, wrap single outputs
-        output_items = agent_output_raw if isinstance(agent_output_raw, list) else [agent_output_raw]
-
-        for item in output_items:
-            # Check for attributes that define AgentAction (more robust than isinstance for version quirks)
-            if hasattr(item, 'tool') and hasattr(item, 'tool_input') and hasattr(item, 'log'):
-                processed_messages.append(AIMessage(
-                    content="", # Tool-calling AI messages often have no content, just tool_calls
-                    tool_calls=[{"name": item.tool, "args": item.tool_input, "id": getattr(item, 'tool_call_id', str(uuid.uuid4()))}]
-                ))
-            # Check for attributes that define AgentFinish
-            elif hasattr(item, 'return_values') and isinstance(getattr(item, 'return_values', None), dict):
-                processed_messages.append(AIMessage(content=item.return_values.get('output', '')))
-            # If it's already a BaseMessage, simply append it
-            elif isinstance(item, BaseMessage):
-                processed_messages.append(item)
-            else:
-                # Fallback for truly unexpected types - this should ideally not be hit
-                raise ValueError(f"Agent runnable returned an item of unexpected type: {type(item)}. Content: {item}")
+        # agent_runnable.invoke usually returns a single item directly, not a list.
+        # So we process the single item first.
+        
+        if isinstance(agent_output_raw, AgentAction):
+            processed_messages.append(AIMessage(
+                content="", 
+                tool_calls=[{"name": agent_output_raw.tool, "args": agent_output_raw.tool_input, "id": getattr(agent_output_raw, 'tool_call_id', str(uuid.uuid4()))}]
+            ))
+        elif isinstance(agent_output_raw, AgentFinish):
+            processed_messages.append(AIMessage(content=agent_output_raw.return_values.get('output', '')))
+        elif isinstance(agent_output_raw, BaseMessage):
+            # If it's already a BaseMessage, just append it
+            processed_messages.append(agent_output_raw)
+        else:
+            # Fallback for truly unexpected types - this should ideally not be hit with this agent type
+            raise ValueError(f"Agent runnable returned an item of unexpected type: {type(agent_output_raw)}. Content: {agent_output_raw}")
 
         # The return value must be a dictionary with a "messages" key containing a List[BaseMessage]
         return {"messages": processed_messages}
@@ -212,7 +233,7 @@ def get_agent_graph():
     def summarize_node(state: AgentState):
         """Summarizes the history and prunes old messages."""
         messages_to_summarize = state["messages"][:-1]
-        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=500, return_messages=False)
+        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False) # Increased limit for better summaries
         for msg in messages_to_summarize:
             if isinstance(msg, HumanMessage): summarizer_memory.chat_memory.add_user_message(msg.content)
             else: summarizer_memory.chat_memory.add_ai_message(msg.content)
