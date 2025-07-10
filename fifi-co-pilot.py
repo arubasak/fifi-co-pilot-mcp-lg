@@ -119,25 +119,32 @@ def get_system_prompt_content_string():
 <system_role>
 You are FiFi, a helpful and expert AI assistant for 1-2-Taste. Your primary goal is to be helpful within your designated scope. Your role is to assist with product and service inquiries, flavours, industry trends, food science, and B2B support. Politely decline out-of-scope questions. You must follow the tool protocol exactly as written to gather information.
 </system_role>
+
 <core_mission_and_scope>
 Your mission is to provide information and support on 1-2-Taste products, the food and beverage industry, food science, and related B2B support. Use the conversation history to understand the user's intent, especially for follow-up questions.
 </core_mission_and_scope>
+
 <tool_protocol>
 Your process for gathering information is a mandatory, sequential procedure. Do not deviate.
+
 1.  **Step 1: Primary Tool Execution.**
     *   For any user query, your first and only initial action is to call the `{pinecone_tool}`.
     *   **Parameters:** Unless specified by a different rule (like the Anti-Repetition Rule), you MUST use `top_k=5` and `snippet_size=1024`.
+
 2.  **Step 2: Mandatory Result Analysis.**
     *   After the primary tool returns a result, you MUST analyze it against the failure conditions below.
+
 3.  **Step 3: Conditional Fallback Execution.**
     *   **If** the primary tool fails (because the result is empty, irrelevant, or lacks a `sourceURL`/`productURL`), then your next and only action **MUST** be to call the `tavily_search_fallback` tool with the original user query.
     *   Do not stop or apologize after a primary tool failure. The fallback call is a required part of the procedure.
+
 4.  **Step 4: Final Answer Formulation.**
     *   Formulate your answer based on the data from the one successful tool call (either the primary or the fallback).
     *   **Disclaimer Rule:** If your answer is based on results from `tavily_search_fallback`, you **MUST** begin your response with this exact disclaimer, enclosed in a markdown quote block:
         > I could not find specific results within the 1-2-Taste EU product database. The following information is from a general web search and may point to external sites not affiliated with 1-2-Taste.
     *   If both tools fail, only then should you state that you could not find the information.
 </tool_protocol>
+
 <formatting_rules>
 - **Citations are Mandatory:** Always cite the URL from the tool you used. When using tavily_search_fallback, you MUST include every source URL provided in the search results.
 - **Source Format:** Present sources as a numbered list with both title and URL for each result.
@@ -154,6 +161,7 @@ Your process for gathering information is a mandatory, sequential procedure. Do 
     *   **Filtering:** Before presenting the new results, you MUST review the conversation history and filter out any products or `sourceURL`s that you have already suggested.
     *   **Response:** If you have new, unique products after filtering, present them. If the larger search returns only products you have already mentioned, you MUST inform the user that you have no new suggestions on this topic. Do not list the old products again.
 </formatting_rules>
+
 <final_instruction>
 Adhering to your core mission and the mandatory tool protocol, provide a helpful and context-aware response to the user's query.
 </final_instruction>
@@ -166,7 +174,6 @@ def get_agent_graph():
     """
     Constructs the LangGraph agent graph with integrated memory summarization.
     """
-    print("--- DEBUG: Initializing agent graph and tools...")
     async def run_async_tool_initialization():
         client = MultiServerMCPClient({
             "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
@@ -176,47 +183,37 @@ def get_agent_graph():
 
     mcp_tools = get_or_create_eventloop().run_until_complete(run_async_tool_initialization())
     all_tools = list(mcp_tools) + [tavily_search_fallback]
-    print(f"--- DEBUG: All tools initialized: {[tool.name for tool in all_tools]}")
     tool_node = ToolNode(all_tools)
 
     system_prompt = get_system_prompt_content_string()
-    try:
-        agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
-        print("--- DEBUG: Agent prompt pulled and partialed successfully.")
-    except Exception as e:
-        print(f"--- ERROR: Failed to pull or partial the agent prompt: {e}")
-        raise
-        
+    agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
-    print("--- DEBUG: Agent runnable created successfully.")
 
     def agent_node(state: AgentState):
         """The 'think' node. Calls the LLM to decide the next action."""
-        print("\n--- DEBUG: Entering agent_node ---")
         chat_history = state["messages"][:-1]
         input_text = state["messages"][-1].content
         
         if state.get("summary"):
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
-            print("--- DEBUG: Summary injected into chat history.")
         
-        invoke_input = {
+        # --- THE FINAL FIX IS HERE ---
+        # The agent runnable's output is already a dictionary in the correct AgentState
+        # format, so we return it directly.
+        result = agent_runnable.invoke({
             "chat_history": chat_history,
             "input": input_text,
             "intermediate_steps": [],
             "tools": all_tools
-        }
-        print(f"--- DEBUG: Invoking agent_runnable with input keys: {invoke_input.keys()}")
-        
-        result = agent_runnable.invoke(invoke_input)
-        print(f"--- DEBUG: agent_runnable result: {result}")
-        return {"messages": [result]}
+        })
+        return result
 
     def summarize_node(state: AgentState):
         """The 'summarize' node. Creates a summary and prunes old messages."""
         print("@@@ MEMORY MGMT: Summarizing conversation...")
         messages_to_summarize = state["messages"][:-1]
+        
         summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=500, return_messages=False)
         for msg in messages_to_summarize:
             if isinstance(msg, HumanMessage):
@@ -228,19 +225,18 @@ def get_agent_graph():
         st.info("Conversation history is long. Summarizing older messages...")
         return {"summary": summary, "messages": messages_to_remove}
 
+    # Define Conditional Edges
     def should_continue_agent_loop(state: AgentState) -> Literal["tools", END]:
-        last_message = state["messages"][-1]
-        print(f"--- DEBUG: Entering should_continue_agent_loop. Last message is AIMessage: {isinstance(last_message, AIMessage)}. Has tool calls: {hasattr(last_message, 'tool_calls') and last_message.tool_calls}")
-        if isinstance(last_message, AIMessage) and not last_message.tool_calls:
+        if isinstance(state["messages"][-1], AIMessage) and not state["messages"][-1].tool_calls:
             return END
         return "tools"
 
     def should_summarize(state: AgentState) -> Literal["summarize", "agent"]:
-        print(f"--- DEBUG: Entering should_summarize. Message count: {len(state['messages'])}")
         if len(state["messages"]) > 6:
             return "summarize"
         return "agent"
 
+    # Build the Graph
     graph_builder = StateGraph(AgentState)
     graph_builder.add_node("agent", agent_node)
     graph_builder.add_node("tools", tool_node)
@@ -251,33 +247,26 @@ def get_agent_graph():
     graph_builder.add_edge("tools", "agent")
     memory = MemorySaver()
     graph = graph_builder.compile(checkpointer=memory)
-    print("--- DEBUG: Graph compiled successfully.")
     return graph
 
-# --- Agent execution logic with full error reporting ---
+# --- Agent execution logic (reverted to non-debugging version) ---
 async def execute_agent_call_with_memory(user_query: str, graph):
     """
-    Runs the agent graph and returns the assistant's reply OR the full error traceback.
+    Runs the agent graph and returns the assistant's reply.
     """
     try:
         config = {"configurable": {"thread_id": THREAD_ID}}
         event = {"messages": [HumanMessage(content=user_query)]}
-        print(f"\n--- DEBUG: Invoking graph for thread '{THREAD_ID}' with new query: '{user_query}' ---")
         final_state = await graph.ainvoke(event, config=config)
-        print("--- DEBUG: Graph invocation complete ---")
         assistant_reply = ""
         if final_state and "messages" in final_state and final_state["messages"]:
             last_message = final_state["messages"][-1]
             if isinstance(last_message, AIMessage):
                 assistant_reply = last_message.content
         return assistant_reply if assistant_reply else "(An error occurred: No AI response was generated.)"
-    except Exception:
-        # This will now capture the full error and format it as a string
-        # to be displayed directly in the chat window.
-        print(f"--- ERROR: Exception caught during graph invocation! ---")
-        traceback.print_exc()
-        error_message = f"**An error occurred during processing:**\n\n```\n{traceback.format_exc()}\n```"
-        return error_message
+    except Exception as e:
+        print(f"Error during graph invocation: {e}\n{traceback.format_exc()}")
+        return f"(An error occurred during processing. Please try again.)"
 
 # --- Input Handling Function ---
 def handle_new_query_submission(query_text: str):
