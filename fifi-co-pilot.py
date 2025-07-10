@@ -5,7 +5,7 @@ from pathlib import Path
 import datetime
 import asyncio
 import os
-import traceback
+import traceback  # <--- IMPORT FOR DETAILED DEBUGGING
 import uuid
 from typing import Annotated, List, Literal
 from typing_extensions import TypedDict
@@ -79,21 +79,26 @@ def get_context(query: str, top_k: int = 5, snippet_size: int = 1024) -> str:
     Retrieves relevant context snippets from the 1-2-Taste Pinecone database.
     Use this as the primary tool to answer questions about products, ingredients, and internal knowledge.
     """
+    FAILURE_MESSAGE = "No relevant context snippets found in the 1-2-Taste database."
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         assistant = pc.assistant.Assistant(assistant_name=PINECONE_ASSISTANT_NAME)
         response = assistant.context(query=query, top_k=top_k, snippet_size=snippet_size)
         if not response.snippets:
-            return "No relevant context snippets found in the 1-2-Taste database."
+            return FAILURE_MESSAGE
         result = "Context Snippets:\n\n"
         for i, snippet in enumerate(response.snippets, 1):
             file_name = snippet.reference.get("file", {}).get("name", "N/A")
             source_url = snippet.reference.get("file", {}).get("signed_url", "N/A")
-
             result += f"{i}. Source: {file_name}\n   URL: {source_url}\n   Snippet: {snippet.content}\n\n"
         return result
     except Exception as e:
-        return f"Error retrieving context from Pinecone: {str(e)}"
+        # --- DEBUGGING CHANGE: PRINT THE FULL TRACEBACK TO THE CONSOLE ---
+        print("\n--- PINECONE TOOL ERROR ---")
+        traceback.print_exc()
+        print("---------------------------\n")
+        # Return the same unambiguous failure message to prevent agent retry loops
+        return FAILURE_MESSAGE
 
 # Tavily Search Tool with Exclusions (Modified for better LLM parsing)
 DEFAULT_EXCLUDED_DOMAINS = [
@@ -191,15 +196,12 @@ def get_agent_graph():
     )
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt_template)
 
-    # --- CORRECTED agent_node ---
     def agent_node(state: AgentState):
         """
         Runs the agent runnable with the current state, correctly parsing messages
         into history, input, and intermediate_steps.
         """
         current_messages = state["messages"]
-
-        # Find the last HumanMessage to demarcate the current turn
         last_human_idx = -1
         for i in range(len(current_messages) - 1, -1, -1):
             if isinstance(current_messages[i], HumanMessage):
@@ -209,18 +211,15 @@ def get_agent_graph():
         if last_human_idx == -1:
             raise ValueError("No HumanMessage found in state. The agent requires a human input to proceed.")
 
-        # Partition messages into history, input, and the current turn's scratchpad
         current_input = current_messages[last_human_idx].content
         chat_history = current_messages[:last_human_idx]
         agent_scratchpad_messages = current_messages[last_human_idx + 1:]
 
-        # Convert the scratchpad messages into the (AgentAction, ToolMessage) format
         intermediate_steps = []
         i = 0
         while i < len(agent_scratchpad_messages):
             if isinstance(agent_scratchpad_messages[i], AIMessage) and agent_scratchpad_messages[i].tool_calls:
                 ai_msg = agent_scratchpad_messages[i]
-                # Check if there is a corresponding tool message
                 if (i + 1) < len(agent_scratchpad_messages) and isinstance(agent_scratchpad_messages[i+1], ToolMessage):
                     tool_msg = agent_scratchpad_messages[i + 1]
                     if tool_msg.tool_call_id == ai_msg.tool_calls[0]['id']:
@@ -233,24 +232,20 @@ def get_agent_graph():
                         intermediate_steps.append((action, tool_msg))
                         i += 2
                         continue
-                # If no corresponding tool message is found, or pairing is incorrect, skip
                 i += 1
             else:
                 i += 1
 
-        # Prepend summary if it exists
         if state.get("summary"):
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
 
-        # Invoke the agent with the correctly structured inputs
         agent_output_raw = agent_runnable.invoke({
             "chat_history": chat_history,
             "input": current_input,
             "intermediate_steps": intermediate_steps
         })
 
-        # Process the agent's output
         processed_messages = []
         output_items = agent_output_raw if isinstance(agent_output_raw, list) else [agent_output_raw]
         for item in output_items:
@@ -269,7 +264,6 @@ def get_agent_graph():
         return {"messages": processed_messages}
 
     def summarize_node(state: AgentState):
-        """Summarizes the history and prunes old messages."""
         messages_to_summarize = state["messages"][:-1]
         summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False)
         for msg in messages_to_summarize:
@@ -281,29 +275,24 @@ def get_agent_graph():
         return {"summary": summary, "messages": messages_to_remove}
 
     def should_continue_agent_loop(state: AgentState) -> Literal["tools", END]:
-        """Decides whether to call a tool or end the turn."""
         last_message = state["messages"][-1]
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
             return "tools"
         return END
 
     def should_summarize(state: AgentState) -> Literal["summarize", "agent"]:
-        """Decides if the conversation is long enough to summarize."""
         if len(state["messages"]) > 6:
             return "summarize"
         return "agent"
 
-    # Build the Unified Graph
     graph_builder = StateGraph(AgentState)
     graph_builder.add_node("summarize", summarize_node)
     graph_builder.add_node("agent", agent_node)
     graph_builder.add_node("tools", tool_node)
-
     graph_builder.add_conditional_edges("__start__", should_summarize, {"summarize": "summarize", "agent": "agent"})
     graph_builder.add_edge("summarize", "agent")
     graph_builder.add_conditional_edges("agent", should_continue_agent_loop, {"tools": "tools", END: END})
     graph_builder.add_edge("tools", "agent")
-
     memory = MemorySaver()
     graph = graph_builder.compile(checkpointer=memory)
     return graph
@@ -315,7 +304,6 @@ async def execute_agent_call_with_memory(user_query: str, graph):
         config = {"configurable": {"thread_id": THREAD_ID}}
         event = {"messages": [HumanMessage(content=user_query)]}
         final_state = await graph.ainvoke(event, config=config)
-
         assistant_reply = final_state["messages"][-1].content
         return assistant_reply if assistant_reply else "(No response was generated.)"
     except Exception as e:
