@@ -6,7 +6,7 @@ tavily-python
 python-dotenv==1.1.0
 
 # LangChain ecosystem (ensure compatibility)
-# --- MODIFIED: Removed specific version pins to resolve dependency conflicts ---
+# Removed specific version pins to resolve dependency conflicts.
 # This allows the installer to find the latest compatible versions.
 langchain
 langchain-core
@@ -15,6 +15,7 @@ langchain-tavily
 
 # LangGraph integration
 langgraph
+# --- MODIFIED: Removed specific version pin for langchain-mcp-adapters ---
 langchain-mcp-adapters
 
 # MCP integration
