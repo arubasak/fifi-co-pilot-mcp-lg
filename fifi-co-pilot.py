@@ -175,32 +175,42 @@ def get_agent_graph():
     Constructs the LangGraph agent graph with integrated memory summarization.
     """
     async def run_async_tool_initialization():
-        # Initialize the MCP client to get the primary tool
         client = MultiServerMCPClient({
             "pinecone": {"url": MCP_PINECONE_URL, "transport": "sse", "headers": {"Authorization": f"Bearer {MCP_PINECONE_API_KEY}"}},
             "pipedream": {"url": MCP_PIPEDREAM_URL, "transport": "sse"}
         })
         return await client.get_tools()
 
-    # Get the MCP tools (e.g., functions.get_context)
     mcp_tools = get_or_create_eventloop().run_until_complete(run_async_tool_initialization())
     all_tools = list(mcp_tools) + [tavily_search_fallback]
     tool_node = ToolNode(all_tools)
 
-    # Create the agent runnable
-    agent_prompt = hub.pull("hwchase17/xml-agent-convo")
+    # --- MODIFIED: Properly bake the system prompt into the agent's prompt template ---
+    # This is the correct way to set the agent's core instructions.
+    system_prompt = get_system_prompt_content_string()
+    agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
 
-    # Define Graph Nodes
+    # --- MODIFIED: Rewritten agent_node to provide the correct input structure ---
     def agent_node(state: AgentState):
-        system_prompt = get_system_prompt_content_string()
+        """The 'think' node. Calls the LLM to decide the next action."""
+        # The agent expects a dictionary with 'input' and 'chat_history' keys
+        chat_history = state["messages"][:-1]
+        input_text = state["messages"][-1].content
+        
+        # Dynamically add the summary to the chat history for the agent's context
         if state.get("summary"):
-            system_prompt += f"\n\nThis is a summary of the preceding conversation:\n{state['summary']}"
-        messages_with_prompt = [SystemMessage(content=system_prompt)] + state["messages"]
-        result = agent_runnable.invoke({"messages": messages_with_prompt})
+            summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
+            chat_history = [summary_message] + chat_history
+
+        result = agent_runnable.invoke({
+            "chat_history": chat_history,
+            "input": input_text
+        })
         return {"messages": [result]}
 
     def summarize_node(state: AgentState):
+        """The 'summarize' node. Creates a summary and prunes old messages."""
         print("@@@ MEMORY MGMT: Summarizing conversation...")
         messages_to_summarize = state["messages"][:-1]
         summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=500, return_messages=False)
