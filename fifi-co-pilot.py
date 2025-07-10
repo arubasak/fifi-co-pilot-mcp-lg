@@ -153,19 +153,29 @@ def get_agent_graph():
     all_tools = list(mcp_tools) + [tavily_search_fallback]
     tool_node = ToolNode(all_tools)
     
+    # This is the agent's brain, created once and reused.
+    system_prompt = get_system_prompt_content_string()
+    agent_prompt = hub.pull("hwchase17/xml-agent-convo").partial(system_message=system_prompt)
+    agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt)
+    
     # Define Graph Nodes
     def agent_node(state: AgentState):
-        """Runs the pre-built agent with the current state."""
-        system_prompt = get_system_prompt_content_string()
+        """Runs the agent runnable with the current state."""
+        chat_history = state["messages"][:-1]
+        input_text = state["messages"][-1].content
+        
         if state.get("summary"):
-            system_prompt += f"\n\nThis is a summary of the preceding conversation:\n{state['summary']}"
+            summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
+            chat_history = [summary_message] + chat_history
         
-        # Use the pre-built agent for the tool-calling loop
-        agent_executor = create_react_agent(llm, all_tools, system_message=system_prompt)
-        result = agent_executor.invoke({"messages": state["messages"]})
-        
-        # The result is already in the correct format {"messages": [AIMessage(...)]}
-        return result
+        # Invoke the agent with all required keys
+        result = agent_runnable.invoke({
+            "chat_history": chat_history,
+            "input": input_text,
+            "intermediate_steps": [], # This is required, even if empty on the first pass
+            "tools": all_tools
+        })
+        return {"messages": [result]}
 
     def summarize_node(state: AgentState):
         """Summarizes the history and prunes old messages."""
@@ -179,19 +189,28 @@ def get_agent_graph():
         st.info("Conversation history is long. Summarizing older messages...")
         return {"summary": summary, "messages": messages_to_remove}
 
-    def should_summarize(state: AgentState) -> Literal["summarize", "run_agent"]:
+    def should_continue_agent_loop(state: AgentState) -> Literal["tools", END]:
+        """Decides whether to call a tool or end the turn."""
+        if isinstance(state["messages"][-1], AIMessage) and not state["messages"][-1].tool_calls:
+            return END
+        return "tools"
+
+    def should_summarize(state: AgentState) -> Literal["summarize", "agent"]:
         """Decides if the conversation is long enough to summarize."""
         if len(state["messages"]) > 6:
             return "summarize"
-        return "run_agent"
+        return "agent"
 
     # Build the Unified Graph
     graph_builder = StateGraph(AgentState)
     graph_builder.add_node("summarize", summarize_node)
-    graph_builder.add_node("run_agent", agent_node)
-    graph_builder.add_conditional_edges("__start__", should_summarize, {"summarize": "summarize", "run_agent": "run_agent"})
-    graph_builder.add_edge("summarize", "run_agent")
-    graph_builder.add_edge("run_agent", END)
+    graph_builder.add_node("agent", agent_node)
+    graph_builder.add_node("tools", tool_node)
+    
+    graph_builder.add_conditional_edges("__start__", should_summarize, {"summarize": "summarize", "agent": "agent"})
+    graph_builder.add_edge("summarize", "agent")
+    graph_builder.add_conditional_edges("agent", should_continue_agent_loop, {"tools": "tools", "__end__": END})
+    graph_builder.add_edge("tools", "agent")
     
     memory = MemorySaver()
     graph = graph_builder.compile(checkpointer=memory)
@@ -205,7 +224,6 @@ async def execute_agent_call_with_memory(user_query: str, graph):
         event = {"messages": [HumanMessage(content=user_query)]}
         final_state = await graph.ainvoke(event, config=config)
         
-        # The final message is the one we want to display
         assistant_reply = final_state["messages"][-1].content
         return assistant_reply if assistant_reply else "(No response was generated.)"
     except Exception as e:
