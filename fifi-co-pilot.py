@@ -20,6 +20,8 @@ from langchain import hub
 from langchain.agents import create_tool_calling_agent
 from langgraph.prebuilt import ToolNode
 from langchain_core.agents import AgentAction, AgentFinish 
+# --- FIXED: Added missing import for ChatPromptTemplate and MessagesPlaceholder ---
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage, BaseMessage
 from langchain_core.tools import tool
 from tavily import TavilyClient
@@ -94,7 +96,7 @@ def get_context(query: str, top_k: int = 5, snippet_size: int = 1024) -> str:
     except Exception as e:
         return f"Error retrieving context from Pinecone: {str(e)}"
 
-# --- Tavily Search Tool with Exclusions (Modified for better LLM parsing) ---
+# Tavily Search Tool with Exclusions (Modified for better LLM parsing)
 DEFAULT_EXCLUDED_DOMAINS = [
     "ingredientsnetwork.com", "csmingredients.com", "batafood.com", "nccingredients.com", "prinovaglobal.com", "ingrizo.com",
     "solina.com", "opply.com", "brusco.co.uk", "lehmanningredients.co.uk", "i-ingredients.com", "fciltd.com", "lupafoods.com",
@@ -196,8 +198,7 @@ def get_agent_graph():
             MessagesPlaceholder("chat_history", optional=True), # History comes next
             ("human", "{input}"), # New user input
             MessagesPlaceholder("agent_scratchpad", optional=True), # Agent's thoughts and tool outputs
-            # --- REMOVED: MessagesPlaceholder("tools", optional=True) ---
-            # tools are passed to create_tool_calling_agent and are handled internally
+            # --- Removed: MessagesPlaceholder("tools", optional=True) as it's handled internally ---
         ]
     )
     agent_runnable = create_tool_calling_agent(llm, all_tools, agent_prompt_template)
@@ -218,12 +219,8 @@ def get_agent_graph():
             "chat_history": chat_history,
             "input": input_text,
             "intermediate_steps": [], # Required by the prompt template
-            # --- REMOVED: "tools": all_tools from invoke call ---
-            # tools are handled internally by create_tool_calling_agent
-        },
-        # Pass custom metadata to LLM invocation for logging correlation
-        config={"metadata": {"langgraph_thread_id": THREAD_ID}}
-        )
+            "tools": all_tools # Required by the prompt template. Yes, add it here for agent_runnable.invoke
+        })
 
         # Robustly convert agent_runnable output to List[BaseMessage]
         processed_messages = []
