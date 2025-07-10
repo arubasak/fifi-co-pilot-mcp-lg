@@ -60,16 +60,14 @@ class AgentState(TypedDict):
 
 # Load environment variables
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-MCP_PINECONE_URL = os.environ.get("MCP_PINECONE_URL") # Keep for MCPClient init even if filtered
-MCP_PINECONE_API_KEY = os.environ.get("MCP_PINECONE_API_KEY") # Keep for MCPClient init even if filtered
-MCP_PIPEDREAM_URL = os.environ.get("MCP_PIPEDREAM_URL") # Keep for MCPClient init even if filtered
+# --- REMOVED: MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREAM_URL ---
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY") # For direct Pinecone client
-PINECONE_ASSISTANT_NAME = os.environ.get("PINECONE_ASSISTANT_NAME") # For direct Pinecone client
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY") 
+PINECONE_ASSISTANT_NAME = os.environ.get("PINECONE_ASSISTANT_NAME") 
 
 
-SECRETS_ARE_MISSING = not all([OPENAI_API_KEY, TAVILY_API_KEY, PINECONE_API_KEY, PINECONE_ASSISTANT_NAME,
-                               MCP_PINECONE_URL, MCP_PINECONE_API_KEY, MCP_PIPEDREAM_URL]) # Re-add MCP secrets check
+# --- MODIFIED: Simplified SECRETS_ARE_MISSING check ---
+SECRETS_ARE_MISSING = not all([OPENAI_API_KEY, TAVILY_API_KEY, PINECONE_API_KEY, PINECONE_ASSISTANT_NAME])
 
 if not SECRETS_ARE_MISSING:
     llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.2)
@@ -97,7 +95,7 @@ def get_context(query: str, top_k: int = 5, snippet_size: int = 1024) -> str:
     except Exception as e:
         return f"Error retrieving context from Pinecone: {str(e)}"
 
-# --- Tavily Search Tool with Exclusions (Modified for better LLM parsing) ---
+# Tavily Search Tool with Exclusions (Modified for better LLM parsing)
 DEFAULT_EXCLUDED_DOMAINS = [
     "ingredientsnetwork.com", "csmingredients.com", "batafood.com", "nccingredients.com", "prinovaglobal.com", "ingrizo.com",
     "solina.com", "opply.com", "brusco.co.uk", "lehmanningredients.co.uk", "i-ingredients.com", "fciltd.com", "lupafoods.com",
@@ -107,11 +105,7 @@ DEFAULT_EXCLUDED_DOMAINS = [
 ]
 @tool
 def tavily_search_fallback(query: str) -> str:
-    """
-    Search the web using Tavily. Use this for queries about broader, public-knowledge topics.
-    This tool automatically excludes a predefined list of competitor and marketplace domains.
-    Returns formatted sources (Title + URL) for the LLM to cite easily.
-    """
+    """Search the web using Tavily, excluding competitor domains."""
     try:
         tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         response = tavily_client.search(
@@ -119,8 +113,6 @@ def tavily_search_fallback(query: str) -> str:
             exclude_domains=DEFAULT_EXCLUDED_DOMAINS
         )
         
-        # --- MODIFIED: Format Tavily output for better LLM citation ---
-        # Provide only the answer and clearly formatted sources, omit raw content for LLM
         formatted_results = ""
         if response.get('answer'):
             formatted_results += f"Web Search Summary: {response['answer']}\n\n"
@@ -128,8 +120,7 @@ def tavily_search_fallback(query: str) -> str:
         if response.get('results'):
             formatted_results += "Sources:\n"
             for i, source in enumerate(response['results'], 1):
-                # Align with system prompt's desired format: "1. **[Title]**: [URL]"
-                formatted_results += f"{i}. **{source.get('title', 'No Title')}**: {source.get('url', 'No URL')}\n"
+                formatted_results += f"1. **{source.get('title', 'No Title')}**: {source.get('url', 'No URL')}\n"
         
         return formatted_results if formatted_results else "No relevant information found via web search."
     except Exception as e: return f"Error performing web search: {str(e)}"
@@ -194,8 +185,7 @@ Adhering to your core mission and the mandatory tool protocol, provide a helpful
 @st.cache_resource(ttl=3600)
 def get_agent_graph():
     """Constructs the unified LangGraph agent with integrated memory."""
-    # --- MODIFIED: Directly define all_tools without MCPClient ---
-    # This completely removes WooCommerce and only includes the essential tools.
+    # --- MODIFIED: Directly define all_tools - No MCPClient used anymore ---
     all_tools = [get_context, tavily_search_fallback]
     tool_node = ToolNode(all_tools) 
     
@@ -210,7 +200,6 @@ def get_agent_graph():
         chat_history = state["messages"][:-1]
         input_text = state["messages"][-1].content
         
-        # --- NEW: Explicitly prepend summary as a SystemMessage if it exists ---
         if state.get("summary"):
             summary_message = SystemMessage(content=f"This is a summary of the preceding conversation:\n{state['summary']}")
             chat_history = [summary_message] + chat_history
@@ -222,41 +211,34 @@ def get_agent_graph():
             "intermediate_steps": [], # Required by the prompt template
             "tools": all_tools # Required by the prompt template
         },
-        # --- NEW: Pass custom metadata to LLM invocation for logging correlation ---
+        # Pass custom metadata to LLM invocation for logging correlation
         config={"metadata": {"langgraph_thread_id": THREAD_ID}}
         )
 
-        # --- CRITICAL FIX: Robustly convert agent_runnable output to List[BaseMessage] ---
+        # Robustly convert agent_runnable output to List[BaseMessage]
         processed_messages = []
-        # agent_runnable.invoke usually returns a single item directly, not a list.
-        # But if it's a list, process each item.
         output_items = agent_output_raw if isinstance(agent_output_raw, list) else [agent_output_raw]
 
         for item in output_items:
-            # Check for attributes that define AgentAction (more robust than isinstance for version quirks)
             if hasattr(item, 'tool') and hasattr(item, 'tool_input') and hasattr(item, 'log'):
                 processed_messages.append(AIMessage(
-                    content="", # Tool-calling AI messages usually have empty content, just tool_calls
+                    content="", 
                     tool_calls=[{"name": item.tool, "args": item.tool_input, "id": getattr(item, 'tool_call_id', str(uuid.uuid4()))}]
                 ))
-            # Check for attributes that define AgentFinish
             elif hasattr(item, 'return_values') and isinstance(getattr(item, 'return_values', None), dict):
                 processed_messages.append(AIMessage(content=item.return_values.get('output', '')))
-            # If it's already a BaseMessage, simply append it
             elif isinstance(item, BaseMessage):
                 processed_messages.append(item)
             else:
-                # Fallback for truly unexpected types - this should ideally not be hit
                 raise ValueError(f"Agent runnable returned an item of unexpected type: {type(item)}. Content: {item}")
 
-        # The return value must be a dictionary with a "messages" key containing a List[BaseMessage]
         return {"messages": processed_messages}
 
 
     def summarize_node(state: AgentState):
         """Summarizes the history and prunes old messages."""
         messages_to_summarize = state["messages"][:-1]
-        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False) # Increased limit for better summaries
+        summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False) 
         for msg in messages_to_summarize:
             if isinstance(msg, HumanMessage): summarizer_memory.chat_memory.add_user_message(msg.content)
             else: summarizer_memory.chat_memory.add_ai_message(msg.content)
@@ -268,7 +250,6 @@ def get_agent_graph():
     def should_continue_agent_loop(state: AgentState) -> Literal["tools", END]:
         """Decides whether to call a tool or end the turn."""
         last_message = state["messages"][-1]
-        # Check if the last message is an AIMessage and contains tool_calls
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
             return "tools"
         return END
@@ -337,7 +318,8 @@ st.markdown("<h1 style='font-size: 24px;'>FiFi, AI sourcing assistant</h1>", uns
 st.caption("Hello, I am FiFi, your AI-powered assistant, designed to support you across the sourcing and product development journey. Find the right ingredients, explore recipe ideas, technical data, and more.")
 
 if SECRETS_ARE_MISSING:
-    st.error("Secrets missing. Please configure necessary environment variables, including OPENAI_API_KEY, TAVILY_API_KEY, PINECONE_API_KEY, PINECONE_ASSISTANT_NAME, MCP_PINECONE_URL, MCP_PINECONE_API_KEY, and MCP_PIPEDREAM_URL.")
+    # --- MODIFIED: Updated secrets missing message ---
+    st.error("Secrets missing. Please configure necessary environment variables, including OPENAI_API_KEY, TAVILY_API_KEY, PINECONE_API_KEY, and PINECONE_ASSISTANT_NAME.")
     st.stop()
 
 if "messages" not in st.session_state: st.session_state.messages = []
