@@ -74,8 +74,8 @@ def get_context(query: str, conversation_history: list = None) -> str:
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         assistant = pc.assistant.Assistant(assistant_name=PINECONE_ASSISTANT_NAME)
-        
         messages = []
+        # The agent can pass the history if it deems it necessary
         if conversation_history:
             for msg in conversation_history:
                 messages.append(Message(role=msg["role"], content=msg["content"]))
@@ -89,7 +89,6 @@ def get_context(query: str, conversation_history: list = None) -> str:
             print("Pinecone tool returned a non-committal answer.")
             return "FAILURE: Pinecone Assistant could not provide a specific answer."
         
-        # Prepend SUCCESS to signal the router that this tool worked.
         return f"SUCCESS: {content}"
     except Exception as e:
         print(f"--- PINECONE TOOL ERROR --- \n{traceback.format_exc()}\n--------------------")
@@ -119,9 +118,11 @@ def tavily_search_fallback(query: str) -> str:
 class Agent:
     def __init__(self, tools, system=""):
         self.system = system
+        self.tools = tools
         graph = StateGraph(AgentState)
         graph.add_node("llm", self.call_llm)
         graph.add_node("action", ToolNode(tools))
+        # FIX: The router is now a method of this class
         graph.add_node("router", self.router)
 
         graph.set_entry_point("llm")
@@ -135,41 +136,36 @@ class Agent:
         """Determines if the LLM decided to call a tool."""
         return isinstance(state['messages'][-1], AIMessage) and state['messages'][-1].tool_calls
 
-    def should_fallback(self, state: AgentState):
+    # FIX: This is now a method of the class
+    def router(self, state: AgentState):
         """After a tool call, this router decides if we need to fall back to Tavily or if we can continue."""
         last_message = state['messages'][-1]
         if not isinstance(last_message, ToolMessage):
             return "continue"
         
-        # If the primary tool failed, loop back to the LLM to call the fallback.
         if last_message.name == "get_context" and last_message.content.startswith("FAILURE:"):
             return "fallback"
-        # Otherwise, we have a successful result (from either tool) and can end the loop.
         return "continue"
+
+    def should_fallback(self, state: AgentState):
+        """This is a simple wrapper for the router to be used in conditional edges."""
+        return self.router(state)
 
     def call_llm(self, state: AgentState):
         """The core logic of the agent. It calls the LLM with the current state."""
         messages = list(state['messages'])
         last_message = messages[-1]
 
-        # If the router sent us here for a fallback, add a specific instruction for the LLM.
         if isinstance(last_message, ToolMessage) and last_message.name == "get_context" and last_message.content.startswith("FAILURE:"):
             user_query = next(m.content for m in reversed(messages) if isinstance(m, HumanMessage))
             messages.append(
                 SystemMessage(content=f"The primary `get_context` tool failed. You MUST now use the `tavily_search_fallback` tool to answer the user's original query: '{user_query}'")
             )
-        # If the last message was a success, strip the "SUCCESS:" prefix before final formatting.
         elif isinstance(last_message, ToolMessage) and last_message.content.startswith("SUCCESS:"):
              last_message.content = last_message.content.replace("SUCCESS:", "").strip()
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", self.system),
-            MessagesPlaceholder(variable_name="messages"),
-        ])
-        
-        # Bind the tools to the LLM so it knows what functions are available.
+        prompt = ChatPromptTemplate.from_messages([("system", self.system), MessagesPlaceholder(variable_name="messages")])
         chain = prompt | llm.bind_tools(self.tools)
-        
         result = chain.invoke({"messages": messages})
         return {'messages': [result]}
 
@@ -177,7 +173,7 @@ class Agent:
 def get_agent_graph():
     """Initializes the agent and its graph."""
     system_prompt = """You are FiFi, an expert AI assistant for 1-2-Taste.
-- Your first step is ALWAYS to use the `get_context` tool to answer the user's question.
+- Your first step is ALWAYS to use the `get_context` tool to answer the user's question. For follow-up questions, you should pass the `conversation_history` to the tool.
 - If the `get_context` tool call fails, the system will provide you with a new instruction. Follow that instruction exactly.
 - When you have the final answer, either from `get_context` or `tavily_search_fallback`, present it clearly to the user. Do not mention internal markers like 'FAILURE' or 'SUCCESS' in your final response.
 """
@@ -190,17 +186,9 @@ async def execute_agent_call_with_memory(user_query: str, graph):
     try:
         config = {"configurable": {"thread_id": THREAD_ID}}
         
-        # Start the conversation with the current user query.
+        # We start a new graph invocation with just the user's latest message.
+        # The checkpointer in the graph will automatically load the previous messages.
         messages = [HumanMessage(content=user_query)]
-        
-        # Add historical messages from the session state to provide context to the tools.
-        # This is passed to `get_context` via the `conversation_history` parameter.
-        if "messages" in st.session_state and st.session_state.messages:
-            history = [
-                {"role": m["role"], "content": m["content"]} for m in st.session_state.messages
-            ]
-            # Modify the tool call in the first HumanMessage to include history
-            messages[0].additional_kwargs = {'tool_input': {'conversation_history': history}}
 
         final_state = await graph.ainvoke({"messages": messages}, config=config)
         assistant_reply = final_state["messages"][-1].content
