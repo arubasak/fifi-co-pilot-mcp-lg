@@ -65,7 +65,7 @@ if not SECRETS_ARE_MISSING:
     if 'thread_id' not in st.session_state: st.session_state.thread_id = f"fifi_streamlit_session_{uuid.uuid4()}"
     THREAD_ID = st.session_state.thread_id
 
-# --- SOLUTION: CREATE A SINGLE, ROBUST TOOL WITH FALLBACK LOGIC BUILT-IN ---
+# --- Robust Information Retrieval Tool ---
 
 DEFAULT_EXCLUDED_DOMAINS = [
     "ingredientsnetwork.com", "csmingredients.com", "batafood.com", "nccingredients.com", "prinovaglobal.com", "ingrizo.com",
@@ -83,39 +83,31 @@ def get_information(query: str, conversation_history: List[Dict[str, str]] = Non
     If the assistant cannot answer or fails, it automatically performs a general web search as a fallback.
     This is the primary and only tool that should be used to find information.
     """
-    # --- Step 1: Try the primary tool (Pinecone Assistant's chat) using your corrected logic ---
     pinecone_response = ""
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         assistant = pc.assistant.Assistant(assistant_name=PINECONE_ASSISTANT_NAME)
-        
         messages = []
         if conversation_history:
             for msg in conversation_history:
                 messages.append(Message(role=msg["role"], content=msg["content"]))
         messages.append(Message(role="user", content=query))
-        
         response = assistant.chat(messages=messages)
-        
         if hasattr(response, 'message') and hasattr(response.message, 'content'):
             pinecone_response = response.message.content
         elif hasattr(response, 'content'):
             pinecone_response = response.content
         else:
             pinecone_response = str(response)
-
     except Exception as e:
         print(f"--- PINECONE TOOL CRITICAL ERROR --- \n{traceback.format_exc()}\n---------------------------")
         pinecone_response = f"Error communicating with Pinecone Assistant: {e}"
 
-    # --- Step 2: Analyze the result and decide on fallback ---
-    # Check for specific failure keywords or if the response is empty/error.
     failure_keywords = ["unable to answer", "don't have information", "cannot provide", "Error:"]
     if pinecone_response and not any(keyword in pinecone_response for keyword in failure_keywords):
         print("Pinecone Assistant provided a valid response.")
         return pinecone_response
     
-    # --- Step 3: Execute the fallback tool (Tavily) if Pinecone failed or couldn't answer ---
     print(f"Pinecone failed or could not answer. Response: '{pinecone_response}'. Proceeding to Tavily fallback.")
     try:
         tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
@@ -123,50 +115,41 @@ def get_information(query: str, conversation_history: List[Dict[str, str]] = Non
             query=query, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False,
             exclude_domains=DEFAULT_EXCLUDED_DOMAINS
         )
-        
         disclaimer = "> I could not find a specific answer within the 1-2-Taste knowledge base. The following information is from a general web search and may point to external sites not affiliated with 1-2-Taste.\n\n"
-        
         formatted_output = disclaimer
         if response.get('answer'):
             formatted_output += f"Web Search Summary: {response['answer']}\n\n"
-        
         if response.get('results'):
             formatted_output += "Sources:\n"
             for i, source in enumerate(response['results'], 1):
                 formatted_output += f"{i}. **{source.get('title', 'No Title')}**: {source.get('url', 'No URL')}\n"
-        
         return formatted_output if len(formatted_output) > len(disclaimer) else "No information found from internal sources or web search."
     except Exception as e:
         return f"An error occurred during the web search: {str(e)}"
 
-# --- SOLUTION: SIMPLIFY THE SYSTEM PROMPT TO USE ONLY ONE TOOL ---
+# --- Simplified System Prompt ---
 def get_system_prompt_content_string():
     prompt = f"""<instructions>
 <system_role>
 You are FiFi, a helpful and expert AI assistant for 1-2-Taste. Your role is to assist with product and service inquiries, flavours, industry trends, food science, and B2B support.
-
 Your ONLY way to gather information is by using the `get_information` tool. You must call this tool for any user query that requires information.
 </system_role>
-
 <formatting_rules>
 - After getting a response from the tool, present the information clearly to the user.
 - If the tool provides sources, you MUST list them at the end of your response.
 - **Product Rules:** Do not mention products without a URL. NEVER provide product prices; direct users to the product page or ask them to contact the Sales Team at: sales-eu@12taste.com.
 </formatting_rules>
-
 <final_instruction>
 Adhering to your core mission, provide a helpful and context-aware response to the user's query by calling the `get_information` tool. Pass the user's query directly to the tool. For follow-up questions, also pass the `conversation_history`.
 </final_instruction>
 </instructions>"""
     return prompt
 
-# --- UNIFIED GRAPH ARCHITECTURE (Now simpler and more robust) ---
+# --- UNIFIED GRAPH ARCHITECTURE ---
 @st.cache_resource(ttl=3600)
 def get_agent_graph():
-    # The agent now only knows about ONE reliable tool.
     all_tools = [get_information]
     tool_node = ToolNode(all_tools)
-
     system_prompt_content = get_system_prompt_content_string()
     agent_prompt_template = ChatPromptTemplate.from_messages(
         [
@@ -186,15 +169,12 @@ def get_agent_graph():
         if last_human_idx == -1: raise ValueError("HumanMessage not found in state.")
         
         current_input = current_messages[last_human_idx].content
-        # Pass the actual message history to the tool
         chat_history_for_tool = [
             {"role": "user" if isinstance(m, HumanMessage) else "assistant", "content": m.content}
             for m in current_messages[:last_human_idx]
         ]
         
-        # This is for the agent_runnable, not the tool
         agent_scratchpad_messages = current_messages[last_human_idx + 1:]
-        
         intermediate_steps = []
         i = 0
         while i < len(agent_scratchpad_messages):
@@ -208,19 +188,14 @@ def get_agent_graph():
                 i += 1
             else: i += 1
 
+        chat_history_for_runnable = current_messages[:last_human_idx]
         if state.get("summary"):
-            chat_history_for_runnable = [SystemMessage(content=f"Conversation summary:\n{state['summary']}")] + current_messages[:last_human_idx]
-        else:
-            chat_history_for_runnable = current_messages[:last_human_idx]
-
-        # Invoke the agent. It will decide to call `get_information`.
+            chat_history_for_runnable = [SystemMessage(content=f"Conversation summary:\n{state['summary']}")] + chat_history_for_runnable
+        
         agent_output_raw = agent_runnable.invoke({
-            "chat_history": chat_history_for_runnable,
-            "input": current_input,
-            "intermediate_steps": intermediate_steps
+            "chat_history": chat_history_for_runnable, "input": current_input, "intermediate_steps": intermediate_steps
         })
         
-        # Special handling to inject conversation_history into the tool call
         if isinstance(agent_output_raw, AgentAction) and agent_output_raw.tool == 'get_information':
             agent_output_raw.tool_input['conversation_history'] = chat_history_for_tool
 
@@ -236,7 +211,6 @@ def get_agent_graph():
             else: raise ValueError(f"Unexpected agent output type: {type(item)}")
         return {"messages": processed_messages}
 
-    # The rest of the graph is standard and reliable
     def summarize_node(state: AgentState):
         messages_to_summarize = state["messages"][:-1]
         summarizer_memory = ConversationSummaryBufferMemory(llm=llm, max_token_limit=1000, return_messages=False)
@@ -253,16 +227,13 @@ def get_agent_graph():
         return "summarize" if len(state["messages"]) > 6 else "agent"
 
     graph_builder = StateGraph(AgentState)
-    graph_builder.add_node("summarize", summarize_node)
-    graph_builder.add_node("agent", agent_node)
-    graph_builder.add_node("tools", tool_node)
+    graph_builder.add_node("summarize", summarize_node); graph_builder.add_node("agent", agent_node); graph_builder.add_node("tools", tool_node)
     graph_builder.add_conditional_edges("__start__", should_summarize, {"summarize": "summarize", "agent": "agent"})
     graph_builder.add_edge("summarize", "agent")
     graph_builder.add_conditional_edges("agent", should_continue_agent_loop, {"tools": "tools", END: END})
     graph_builder.add_edge("tools", "agent")
     return graph_builder.compile(checkpointer=MemorySaver())
 
-# --- Agent execution logic (no changes needed) ---
 async def execute_agent_call_with_memory(user_query: str, graph):
     try:
         config = {"configurable": {"thread_id": THREAD_ID}}
@@ -271,11 +242,9 @@ async def execute_agent_call_with_memory(user_query: str, graph):
         assistant_reply = final_state["messages"][-1].content
         return assistant_reply if assistant_reply else "(No response was generated.)"
     except Exception as e:
-        print(f"--- ERROR: Exception caught during execution! ---")
-        traceback.print_exc()
+        print(f"--- ERROR: Exception caught during execution! ---"); traceback.print_exc()
         return f"**An error occurred during processing:**\n\n```\n{traceback.format_exc()}\n```"
 
-# --- UI (no changes needed) ---
 def handle_new_query_submission(query_text: str):
     if not st.session_state.get('thinking_for_ui', False):
         st.session_state.active_question = query_text
@@ -312,10 +281,20 @@ for question in preview_questions:
     if st.sidebar.button(question, key=f"preview_{question}", use_container_width=True, type=button_type): handle_new_query_submission(question)
 
 st.sidebar.markdown("---")
+# --- FIX: Using the more stable, targeted reset logic ---
 if st.sidebar.button("🧹 Reset chat session", use_container_width=True):
-    st.session_state.clear(); st.rerun()
+    st.session_state.messages = []
+    st.session_state.thinking_for_ui = False
+    st.session_state.query_to_process = None
+    st.session_state.thread_id = f"fifi_streamlit_session_{uuid.uuid4()}"
+    st.session_state.active_question = None
+    st.rerun()
 
 st.sidebar.markdown('By using this agent, you agree to our <a href="https://www.12taste.com/terms-conditions/" target="_blank">Terms of Service</a>.', unsafe_allow_html=True)
+
+# --- FIX: Re-defining the avatar variables before the loop ---
+fifi_avatar_icon = f"data:image/png;base64,{FIFI_AVATAR_B64}" if FIFI_AVATAR_B64 else "🤖"
+user_avatar_icon = f"data:image/png;base64,{USER_AVATAR_B64}" if USER_AVATAR_B64 else "🧑‍💻"
 
 for message in st.session_state.get("messages", []):
     avatar_icon = fifi_avatar_icon if message["role"] == "assistant" else user_avatar_icon
