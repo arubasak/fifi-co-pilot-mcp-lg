@@ -180,7 +180,7 @@ Your process for gathering information is a mandatory, sequential procedure. Do 
 4.  **Step 4: Final Answer Formulation.**
     *   Formulate your answer based on the data from the one successful tool call (either the primary or the fallback).
     *   **Disclaimer Rule:** If your answer is based on results from `tavily_search_fallback`, you **MUST** begin your response with this exact disclaimer, enclosed in a markdown quote block:
-        > I could not find specific results within the 1-2-Taste EU product database. The following information is from a general web search and may point to external sites not affiliated with 1-2-Taste.
+        > I could not find specific results within the 1-2-Taste IN product database. The following information is from a general web search and may point to external sites not affiliated with 1-2-Taste.
     *   If both tools fail, only then should you state that you could not find the information.
 </tool_protocol>
 
