@@ -330,42 +330,71 @@ def handle_new_query_submission(query_text: str):
 # --- Streamlit App UI ---
 st.markdown("""
 <style>
+    /* Base styling for the chat input bar */
     .st-emotion-cache-1629p8f {
         border: 1px solid #ffffff;
         border-radius: 7px;
-        bottom: 5px;
         position: fixed;
+        bottom: 10px; /* Increased from 5px to ensure visibility above mobile browser UI */
         width: 100%;
         max-width: 736px;
         left: 50%;
         transform: translateX(-50%);
-        z-index: 101;
+        z-index: 1000; /* Increased z-index to ensure input stays above all elements */
+        box-sizing: border-box; /* Ensure padding/border don't affect width */
     }
+
+    /* Focus state for input bar */
     .st-emotion-cache-1629p8f:focus-within {
         border-color: #e6007e;
     }
+
+    /* Caption styling */
     [data-testid="stCaptionContainer"] p {
         font-size: 1.3em !important;
     }
+
+    /* Adjust vertical block padding to reduce bottom space */
     [data-testid="stVerticalBlock"] {
-        padding-bottom: 40px;
+        padding-bottom: 20px; /* Reduced from 40px to minimize extra space */
+        min-height: 100vh; /* Ensure content fills viewport height */
     }
+
+    /* Chat message spacing */
     [data-testid="stChatMessage"] {
         margin-top: 0.1rem !important;
         margin-bottom: 0.1rem !important;
     }
+
+    /* Ensure the app is scrollable */
     .stApp {
         overflow-y: auto !important;
     }
+
+    /* Hide unnecessary Streamlit elements */
     .st-scroll-to-bottom {
         display: none !important;
     }
     .st-emotion-cache-1fplawd {
         display: none !important;
     }
+
+    /* Mobile-specific adjustments */
+    @media (max-width: 600px) {
+        .st-emotion-cache-1629p8f {
+            bottom: calc(10px + env(safe-area-inset-bottom)); /* Account for mobile safe areas */
+            max-width: 95%; /* Slightly narrower for mobile */
+            padding: 8px; /* Ensure padding for touch targets */
+        }
+        [data-testid="stVerticalBlock"] {
+            padding-bottom: 10px; /* Further reduce padding for mobile */
+        }
+        .stApp {
+            padding-bottom: 60px; /* Add padding to account for fixed input bar */
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
-
 st.markdown("<h1 style='font-size: 24px;'>FiFi, AI sourcing assistant</h1>", unsafe_allow_html=True)
 st.caption("Hello, I am FiFi, your AI-powered assistant, designed to support you across the sourcing and product development journey. Find the right ingredients, explore recipe ideas, technical data, and more.")
 
