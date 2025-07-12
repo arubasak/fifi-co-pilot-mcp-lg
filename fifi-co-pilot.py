@@ -349,7 +349,7 @@ st.markdown("""
         font-size: 1.3em !important;
     }
     [data-testid="stVerticalBlock"] {
-        padding-bottom: 60px;
+        padding-bottom: 80px;
     }
     [data-testid="stChatMessage"] {
         margin-top: 0.1rem !important;
