@@ -331,32 +331,29 @@ def handle_new_query_submission(query_text: str):
 # --- Streamlit App UI ---
 st.markdown("""
 <style>
-    /* Main container for all chat messages */
+    /* STABLE: Add padding to the bottom of the main chat container. */
+    /* This prevents the chat input from overlapping the last message. */
     [data-testid="stVerticalBlock"] {
-        /* This creates space at the bottom for the chat input to sit without overlapping the last message */
-        padding-bottom: 7rem; /* Adjust this value as needed */
+        padding-bottom: 5rem; /* Increased padding slightly for better spacing */
     }
 
-    /* The container for st.chat_input */
-    [data-testid="stChatInput"] {
-        position: fixed;
-        bottom: 0;
-        width: 100%;
-        background-color: white; /* Or match your theme's background color */
-        padding: 1rem 0;
-        border-top: 1px solid #e6e6e6;
-        z-index: 100;
+    /* STABLE: Increase the font size of the app's caption. */
+    [data-testid="stCaptionContainer"] p {
+        font-size: 1.3em !important;
     }
 
-    /* The inner input bar within the container, keeping it centered */
-    .st-emotion-cache-1629p8f {
-        /* This is the class from your code, we keep its centering logic */
-        position: relative; /* It no longer needs to be fixed, its parent is */
-        max-width: 736px;
-        margin: 0 auto; /* Center the input bar */
-        left: 0;
-        transform: none;
+    /* STABLE: Reduce the vertical margin between individual chat messages. */
+    [data-testid="stChatMessage"] {
+        margin-top: 0.1rem !important;
+        margin-bottom: 0.1rem !important;
     }
+
+    /*
+      NOTE: All rules targeting unstable 'st-emotion-cache-*' classes have been removed.
+      Streamlit's st.chat_input component handles its own positioning, width, and focus
+      styles automatically. The manual overrides were causing the element to disappear
+      on mobile. The default behavior is responsive and works correctly on all devices.
+    */
 </style>
 """, unsafe_allow_html=True)
 st.markdown("<h1 style='font-size: 24px;'>FiFi, AI sourcing assistant</h1>", unsafe_allow_html=True)
