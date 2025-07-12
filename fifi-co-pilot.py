@@ -331,31 +331,42 @@ def handle_new_query_submission(query_text: str):
 # --- Streamlit App UI ---
 st.markdown("""
 <style>
-    /* STABLE: Add padding to the bottom of the main chat container. */
-    /* This prevents the chat input from overlapping the last message. */
-    [data-testid="stVerticalBlock"] {
-        padding-bottom: 5rem; /* Increased padding slightly for better spacing */
+    .st-emotion-cache-1629p8f {
+        border: 1px solid #ffffff;
+        border-radius: 7px;
+        bottom: 5px;
+        position: fixed;
+        width: 100%;
+        max-width: 736px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 101;
     }
-
-    /* STABLE: Increase the font size of the app's caption. */
+    .st-emotion-cache-1629p8f:focus-within {
+        border-color: #e6007e;
+    }
     [data-testid="stCaptionContainer"] p {
         font-size: 1.3em !important;
     }
-
-    /* STABLE: Reduce the vertical margin between individual chat messages. */
+    [data-testid="stVerticalBlock"] {
+        padding-bottom: 60px;
+    }
     [data-testid="stChatMessage"] {
         margin-top: 0.1rem !important;
         margin-bottom: 0.1rem !important;
     }
-
-    /*
-      NOTE: All rules targeting unstable 'st-emotion-cache-*' classes have been removed.
-      Streamlit's st.chat_input component handles its own positioning, width, and focus
-      styles automatically. The manual overrides were causing the element to disappear
-      on mobile. The default behavior is responsive and works correctly on all devices.
-    */
+    .stApp {
+        overflow-y: auto !important;
+    }
+    .st-scroll-to-bottom {
+        display: none !important;
+    }
+    .st-emotion-cache-1fplawd {
+        display: none !important;
+    }
 </style>
 """, unsafe_allow_html=True)
+
 st.markdown("<h1 style='font-size: 24px;'>FiFi, AI sourcing assistant</h1>", unsafe_allow_html=True)
 st.caption("Hello, I am FiFi, your AI-powered assistant, designed to support you across the sourcing and product development journey. Find the right ingredients, explore recipe ideas, technical data, and more.")
 
